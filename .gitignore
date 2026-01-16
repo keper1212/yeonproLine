@@ -1,0 +1,39 @@
+# --- OS 관련 (macOS, Windows) ---
+.DS_Store
+Thumbs.db
+
+# --- 파이썬 및 FastAPI 관련 ---
+__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache/
+.python-version
+
+
+# --- Node.js 및 Next.js 관련 ---
+node_modules/
+.next/
+out/
+build/
+dist/
+.npm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- 환경 변수 및 비밀 정보 (가장 중요!) ---
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# --- 데이터베이스 및 로그 ---
+*.sqlite3
+*.log
+postgresql_data/
+
+# --- IDE 설정 (VS Code 등) ---
+.vscode/
+.idea/
+
