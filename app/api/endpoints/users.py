@@ -81,11 +81,22 @@ def read_summary(
     correct = int(scored_counts.correct or 0)
     accuracy = round((correct / total) * 100, 2) if total else 0.0
 
+    primary_badge = None
+    if current_user.primary_badge_id:
+        primary_badge = (
+            db.query(BadgeMaster)
+            .filter(BadgeMaster.id == current_user.primary_badge_id)
+            .first()
+        )
+
     return UserSummary(
         nickname=current_user.nickname,
         points=current_user.points,
         accuracy_rate=accuracy,
         participated_episodes=int(participated_episodes or 0),
+        primary_badge_id=current_user.primary_badge_id,
+        primary_badge_name=primary_badge.name if primary_badge else None,
+        primary_badge_icon_url=primary_badge.icon_url if primary_badge else None,
     )
 
 

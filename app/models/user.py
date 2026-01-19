@@ -1,4 +1,4 @@
-from sqlalchemy import BigInteger, Column, Integer, JSON, String
+from sqlalchemy import BigInteger, Column, ForeignKey, Integer, JSON, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import text
 
@@ -13,6 +13,7 @@ class User(Base):
     email = Column(String(255), unique=True)
     google_id = Column(String(255), unique=True)
     points = Column(Integer, nullable=False, server_default=text("0"))
+    primary_badge_id = Column(Integer, ForeignKey("badges_master.id"))
     personality_analysis = Column(
         JSON().with_variant(JSONB, "postgresql"),
         nullable=False,

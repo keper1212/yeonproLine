@@ -34,6 +34,9 @@ class UserSummary(BaseModel):
     points: int
     accuracy_rate: float
     participated_episodes: int
+    primary_badge_id: Optional[int] = None
+    primary_badge_name: Optional[str] = None
+    primary_badge_icon_url: Optional[str] = None
 
 
 class BadgeItem(BaseModel):
