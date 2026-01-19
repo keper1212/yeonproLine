@@ -1,4 +1,5 @@
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
@@ -126,7 +127,8 @@ async def chat_socket(websocket: WebSocket) -> None:
             if not content:
                 continue
 
-            chat = Chat(user_id=user.id, content=content, created_at=datetime.utcnow())
+            kst_now = datetime.now(ZoneInfo("Asia/Seoul")).replace(tzinfo=None)
+            chat = Chat(user_id=user.id, content=content, created_at=kst_now)
             db.add(chat)
             db.commit()
             db.refresh(chat)
