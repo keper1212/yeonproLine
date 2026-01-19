@@ -31,9 +31,13 @@ yarn-error.log*
 # --- 데이터베이스 및 로그 ---
 *.sqlite3
 *.log
-postgresql_data/
+postgres_data/
 
 # --- IDE 설정 (VS Code 등) ---
 .vscode/
 .idea/
+
+AGENTS.md
+*.yaml
+
 
