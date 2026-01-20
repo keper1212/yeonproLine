@@ -91,7 +91,7 @@ def crawl_posts(pages: int) -> List[str]:
                 content = _parse_post(detail)
                 if content:
                     posts.append(content)
-                time.sleep(0.2)
+                time.sleep(2.0)
     return posts
 
 
