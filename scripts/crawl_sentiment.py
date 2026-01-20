@@ -178,37 +178,26 @@ def gemini_analyze_all_targets_hourly(
             }
         ]
     }
-    retry_delay = 30
-    max_retries = 5
-    for attempt in range(1, max_retries + 1):
-        try:
-            res = requests.post(
-                f"{GEMINI_ENDPOINT}?key={api_key}",
-                headers={"Content-Type": "application/json"},
-                data=json.dumps(payload),
-                timeout=240,
-            )
-            if res.status_code == 503:
-                print(
-                    f"[gemini] model overloaded (503), retry {attempt}/{max_retries} "
-                    f"after {retry_delay}s"
-                )
-                time.sleep(retry_delay)
-                continue
-            res.raise_for_status()
-            data = res.json()
-            text_out = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            if text_out.startswith("```"):
-                text_out = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", text_out).strip()
-            return json.loads(text_out)
-        except Exception as exc:
-            status = getattr(locals().get("res", None), "status_code", None)
-            body = getattr(locals().get("res", None), "text", None)
-            print(f"[gemini] hourly analysis failed status={status} error={exc}")
-            if body:
-                print(f"[gemini] hourly analysis response: {body[:500]}")
-            return None
-    return None
+    try:
+        res = requests.post(
+            f"{GEMINI_ENDPOINT}?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload),
+            timeout=240,
+        )
+        res.raise_for_status()
+        data = res.json()
+        text_out = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        if text_out.startswith("```"):
+            text_out = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", text_out).strip()
+        return json.loads(text_out)
+    except Exception as exc:
+        status = getattr(locals().get("res", None), "status_code", None)
+        body = getattr(locals().get("res", None), "text", None)
+        print(f"[gemini] hourly analysis failed status={status} error={exc}")
+        if body:
+            print(f"[gemini] hourly analysis response: {body[:500]}")
+        return None
 
 
 def load_participants() -> List[Dict]:
