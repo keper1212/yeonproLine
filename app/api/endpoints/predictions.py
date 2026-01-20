@@ -65,6 +65,24 @@ def _season_final_vote_open(db: Session) -> bool:
     return len(items) > 0
 
 
+def _season_item_id(db: Session, category: str) -> int:
+    item = (
+        db.query(PredictionItem)
+        .filter(
+            PredictionItem.scope == "season",
+            PredictionItem.category == category,
+        )
+        .order_by(PredictionItem.id.asc())
+        .first()
+    )
+    if not item:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing season prediction item: {category}",
+        )
+    return item.id
+
+
 @router.get("/predictions/overview", response_model=PredictionsOverview)
 def get_predictions_overview(
     db: Session = Depends(get_db),
@@ -156,6 +174,7 @@ def submit_season_couples(
 
     next_episode = _next_episode(db)
     season_episode_id = _season_episode_id(db, next_episode.id if next_episode else None)
+    season_item_id = _season_item_id(db, "season_final_couple")
 
     existing = (
         db.query(Prediction)
@@ -190,6 +209,7 @@ def submit_season_couples(
             Prediction(
                 user_id=current_user.id,
                 episode_id=season_episode_id,
+                prediction_item_id=season_item_id,
                 prediction_type="season_final_couple",
                 target_participant_id=pair.male_id,
                 selected_value=f"{pair.female_id}:{pair.male_id}",
@@ -240,11 +260,14 @@ def submit_season_final_votes(
         raise HTTPException(status_code=409, detail="Final votes already submitted")
 
     season_episode_id = _season_episode_id(db, None)
+    final_zero_item_id = _season_item_id(db, "final_zero_vote")
+    popular_one_item_id = _season_item_id(db, "season_popular_one")
 
     db.add(
         Prediction(
             user_id=current_user.id,
             episode_id=season_episode_id,
+            prediction_item_id=final_zero_item_id,
             prediction_type="season_final_zero",
             target_participant_id=payload.final_zero_vote_participant_id,
             selected_value=str(payload.final_zero_vote_participant_id),
@@ -254,6 +277,7 @@ def submit_season_final_votes(
         Prediction(
             user_id=current_user.id,
             episode_id=season_episode_id,
+            prediction_item_id=popular_one_item_id,
             prediction_type="season_popular_one",
             target_participant_id=payload.season_popular_participant_id,
             selected_value=str(payload.season_popular_participant_id),
