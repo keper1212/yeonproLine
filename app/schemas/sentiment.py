@@ -24,6 +24,9 @@ class SentimentEvent(BaseModel):
 
 
 class SentimentOverview(BaseModel):
+    female_id: Optional[int] = None
+    male_id: Optional[int] = None
+    target_id: Optional[int] = None
     support_rate: int
     delta_5m: int
     history: List[SentimentPoint]

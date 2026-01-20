@@ -30,6 +30,55 @@ def _build_condition(
     )
 
 
+def _fetch_overview(
+    db: Session,
+    condition: str,
+    params: dict,
+    history_limit: int,
+):
+    latest_row = db.execute(
+        text(
+            "SELECT support_rate, delta_5m, captured_at "
+            "FROM sentiment_snapshots "
+            f"WHERE {condition} "
+            "ORDER BY captured_at DESC LIMIT 1"
+        ),
+        params,
+    ).fetchone()
+
+    history_rows = db.execute(
+        text(
+            "SELECT captured_at, support_rate "
+            "FROM sentiment_snapshots "
+            f"WHERE {condition} "
+            "ORDER BY captured_at DESC LIMIT :limit"
+        ),
+        {**params, "limit": history_limit},
+    ).fetchall()
+
+    summary_row = db.execute(
+        text(
+            "SELECT summary_text "
+            "FROM sentiment_summaries "
+            f"WHERE {condition} "
+            "ORDER BY generated_at DESC LIMIT 1"
+        ),
+        params,
+    ).fetchone()
+
+    event_row = db.execute(
+        text(
+            "SELECT event_type, delta, start_at, end_at "
+            "FROM sentiment_events "
+            f"WHERE {condition} "
+            "ORDER BY end_at DESC LIMIT 1"
+        ),
+        params,
+    ).fetchone()
+
+    return latest_row, history_rows, summary_row, event_row
+
+
 @router.get("/sentiment/participants", response_model=List[ParticipantSummary])
 def read_sentiment_participants(db: Session = Depends(get_db)) -> List[ParticipantSummary]:
     rows = db.execute(
@@ -55,53 +104,59 @@ def read_sentiment_overview(
     db: Session = Depends(get_db),
 ) -> SentimentOverview:
     condition, params = _build_condition(female_id, male_id, target_id)
+    resolved_female_id = female_id
+    resolved_male_id = male_id
+    resolved_target_id = target_id
 
-    latest_row = db.execute(
-        text(
-            "SELECT support_rate, delta_5m, captured_at "
-            "FROM sentiment_snapshots "
-            f"WHERE {condition} "
-            "ORDER BY captured_at DESC LIMIT 1"
-        ),
-        params,
-    ).fetchone()
+    latest_row, history_rows, summary_row, event_row = _fetch_overview(
+        db, condition, params, history_limit
+    )
 
-    history_rows = db.execute(
-        text(
-            "SELECT captured_at, support_rate "
-            "FROM sentiment_snapshots "
-            f"WHERE {condition} "
-            "ORDER BY captured_at DESC LIMIT :limit"
-        ),
-        {**params, "limit": history_limit},
-    ).fetchall()
+    if not history_rows:
+        if target_id:
+            fallback_row = db.execute(
+                text(
+                    "SELECT target_participant_id "
+                    "FROM sentiment_snapshots "
+                    "WHERE target_participant_id IS NOT NULL "
+                    "ORDER BY captured_at DESC LIMIT 1"
+                )
+            ).fetchone()
+            if fallback_row:
+                resolved_target_id = fallback_row.target_participant_id
+                condition, params = _build_condition(None, None, resolved_target_id)
+        else:
+            fallback_row = db.execute(
+                text(
+                    "SELECT female_id, male_id "
+                    "FROM sentiment_snapshots "
+                    "WHERE female_id IS NOT NULL "
+                    "AND male_id IS NOT NULL "
+                    "AND target_participant_id IS NULL "
+                    "ORDER BY captured_at DESC LIMIT 1"
+                )
+            ).fetchone()
+            if fallback_row:
+                resolved_female_id = fallback_row.female_id
+                resolved_male_id = fallback_row.male_id
+                condition, params = _build_condition(
+                    resolved_female_id, resolved_male_id, None
+                )
+
+        if resolved_female_id or resolved_target_id:
+            latest_row, history_rows, summary_row, event_row = _fetch_overview(
+                db, condition, params, history_limit
+            )
 
     history = [
         SentimentPoint(captured_at=row.captured_at, support_rate=row.support_rate)
         for row in reversed(history_rows)
     ]
 
-    summary_row = db.execute(
-        text(
-            "SELECT summary_text "
-            "FROM sentiment_summaries "
-            f"WHERE {condition} "
-            "ORDER BY generated_at DESC LIMIT 1"
-        ),
-        params,
-    ).fetchone()
-
-    event_row = db.execute(
-        text(
-            "SELECT event_type, delta, start_at, end_at "
-            "FROM sentiment_events "
-            f"WHERE {condition} "
-            "ORDER BY end_at DESC LIMIT 1"
-        ),
-        params,
-    ).fetchone()
-
     return SentimentOverview(
+        female_id=resolved_female_id,
+        male_id=resolved_male_id,
+        target_id=resolved_target_id,
         support_rate=latest_row.support_rate if latest_row else 0,
         delta_5m=latest_row.delta_5m if latest_row else 0,
         history=history,
