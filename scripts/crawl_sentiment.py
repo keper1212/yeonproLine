@@ -75,23 +75,32 @@ def _parse_post(html: str) -> Optional[str]:
     return f"{title_text}\n{body_text}"
 
 
-def crawl_posts(pages: int) -> List[str]:
+def crawl_posts(pages: int, max_posts: int) -> List[str]:
     posts: List[str] = []
     for base in LIST_URLS:
+        print(f"[crawl] list base: {base}")
         for page in range(1, pages + 1):
             page_url = f"{base}&page={page}"
+            print(f"[crawl] list page: {page_url}")
             html = _http_get(page_url)
             if not html:
+                print(f"[crawl] list fetch failed: {page_url}")
                 continue
             links = _parse_list_page(html, base)
             for link in links:
+                if len(posts) >= max_posts:
+                    print(f"[crawl] reached max_posts={max_posts}, stop crawling")
+                    return posts
                 detail = _http_get(link)
                 if not detail:
+                    print(f"[crawl] post fetch failed: {link}")
                     continue
                 content = _parse_post(detail)
                 if content:
                     print(f"[crawl] fetched post: {link}")
                     posts.append(content)
+                else:
+                    print(f"[crawl] post parse failed: {link}")
                 time.sleep(2.0)
     return posts
 
@@ -277,6 +286,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pages", type=int, default=1)
     parser.add_argument("--event-threshold", type=int, default=5)
+    parser.add_argument("--max-posts", type=int, default=5)
     args = parser.parse_args()
 
     api_key = os.getenv("GEMINI_API_KEY")
@@ -284,36 +294,55 @@ def main() -> None:
         raise SystemExit("GEMINI_API_KEY 환경변수를 설정하세요.")
 
     participants = load_participants()
-    posts = crawl_posts(args.pages)
+    print(f"[run] participants loaded: {len(participants)}")
+    posts = crawl_posts(args.pages, args.max_posts)
+    print(f"[run] posts collected: {len(posts)}")
 
     pair_scores: Dict[Tuple[int, int], List[int]] = defaultdict(list)
     single_scores: Dict[int, List[int]] = defaultdict(list)
     pair_texts: Dict[Tuple[int, int], List[str]] = defaultdict(list)
     single_texts: Dict[int, List[str]] = defaultdict(list)
 
+    classify_attempts = 0
+    classify_failures = 0
+    matched_posts = 0
+
     for text_content in posts:
         females, males = detect_mentions(text_content, participants)
         if females and males:
+            matched_posts += 1
             for f in females:
                 for m in males:
                     label = f"{f['name']}♥{m['name']}"
+                    classify_attempts += 1
                     sentiment = gemini_classify(api_key, label, text_content)
                     if sentiment is None:
+                        classify_failures += 1
                         continue
                     pair_scores[(f["id"], m["id"])].append(sentiment)
                     pair_texts[(f["id"], m["id"])].append(text_content)
         else:
             targets = females or males
             for t in targets:
+                matched_posts += 1
+                classify_attempts += 1
                 sentiment = gemini_classify(api_key, t["name"], text_content)
                 if sentiment is None:
+                    classify_failures += 1
                     continue
                 single_scores[t["id"]].append(sentiment)
                 single_texts[t["id"]].append(text_content)
 
+    print(f"[run] matched posts: {matched_posts}")
+    print(f"[run] classify attempts: {classify_attempts}, failures: {classify_failures}")
+
     db = SessionLocal()
     try:
         episode_id = current_episode_id(db)
+        print(f"[db] current episode id: {episode_id}")
+        snapshot_inserts = 0
+        event_inserts = 0
+        summary_inserts = 0
 
         for (female_id, male_id), scores in pair_scores.items():
             positives = sum(1 for s in scores if s > 0)
@@ -323,12 +352,15 @@ def main() -> None:
             last_rate = fetch_last_snapshot(db, female_id, male_id, None)
             delta_5m = support_rate - last_rate if last_rate is not None else 0
             insert_snapshot(db, episode_id, female_id, male_id, None, support_rate, delta_5m)
+            snapshot_inserts += 1
             if abs(delta_5m) >= args.event_threshold:
                 insert_event(db, episode_id, female_id, male_id, None, delta_5m)
+                event_inserts += 1
 
             summary = gemini_summary(api_key, f"{female_id}-{male_id}", pair_texts[(female_id, male_id)])
             if summary:
                 insert_summary(db, episode_id, female_id, male_id, None, summary)
+                summary_inserts += 1
 
         for target_id, scores in single_scores.items():
             positives = sum(1 for s in scores if s > 0)
@@ -338,14 +370,21 @@ def main() -> None:
             last_rate = fetch_last_snapshot(db, None, None, target_id)
             delta_5m = support_rate - last_rate if last_rate is not None else 0
             insert_snapshot(db, episode_id, None, None, target_id, support_rate, delta_5m)
+            snapshot_inserts += 1
             if abs(delta_5m) >= args.event_threshold:
                 insert_event(db, episode_id, None, None, target_id, delta_5m)
+                event_inserts += 1
 
             summary = gemini_summary(api_key, f"participant-{target_id}", single_texts[target_id])
             if summary:
                 insert_summary(db, episode_id, None, None, target_id, summary)
+                summary_inserts += 1
 
         db.commit()
+        print(
+            f"[db] commit ok: snapshots={snapshot_inserts}, "
+            f"events={event_inserts}, summaries={summary_inserts}"
+        )
     finally:
         db.close()
 
