@@ -14,6 +14,7 @@ class ParticipantSummary(BaseModel):
 class SentimentPoint(BaseModel):
     captured_at: datetime
     support_rate: int
+    episode_id: Optional[int] = None
 
 
 class SentimentEvent(BaseModel):

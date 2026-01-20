@@ -245,6 +245,26 @@ def current_episode_id(db) -> Optional[int]:
     return row.id if row else None
 
 
+def episode_capture_time(db, episode_id: Optional[int]) -> datetime:
+    if not episode_id:
+        return datetime.now()
+    row = db.execute(
+        text("SELECT start_time FROM episodes WHERE id = :episode_id"),
+        {"episode_id": episode_id},
+    ).fetchone()
+    if not row:
+        return datetime.now()
+    start_time = row.start_time
+    return datetime(
+        start_time.year,
+        start_time.month,
+        start_time.day,
+        16,
+        0,
+        0,
+    )
+
+
 def fetch_last_snapshot(db, female_id, male_id, target_id) -> Optional[int]:
     row = db.execute(
         text(
@@ -263,7 +283,16 @@ def fetch_last_snapshot(db, female_id, male_id, target_id) -> Optional[int]:
     return row.support_rate if row else None
 
 
-def insert_snapshot(db, episode_id, female_id, male_id, target_id, support_rate, delta_5m):
+def insert_snapshot(
+    db,
+    episode_id,
+    female_id,
+    male_id,
+    target_id,
+    support_rate,
+    delta_5m,
+    captured_at,
+):
     db.execute(
         text(
             "INSERT INTO sentiment_snapshots "
@@ -277,7 +306,7 @@ def insert_snapshot(db, episode_id, female_id, male_id, target_id, support_rate,
             "target_id": target_id,
             "support_rate": support_rate,
             "delta_5m": delta_5m,
-            "captured_at": datetime.now(),
+            "captured_at": captured_at,
         },
     )
 
@@ -339,6 +368,7 @@ def main() -> None:
     )
     parser.add_argument("--event-threshold", type=int, default=5)
     parser.add_argument("--max-posts", type=int, default=200)
+    parser.add_argument("--episode-id", type=int, default=None)
     args = parser.parse_args()
 
     api_key = os.getenv("GEMINI_API_KEY")
@@ -366,12 +396,13 @@ def main() -> None:
 
     db = SessionLocal()
     try:
-        episode_id = current_episode_id(db)
+        episode_id = args.episode_id or current_episode_id(db)
         print(f"[db] current episode id: {episode_id}")
         prior_summaries: Dict[str, str] = {}
         prior_label_meta: Dict[str, Dict] = {}
         total_urls = len(LIST_URLS)
 
+        capture_time = episode_capture_time(db, episode_id)
         for idx, (base_url, start_page) in enumerate(zip(LIST_URLS, pages_list)):
             posts = crawl_posts(base_url, start_page, args.page_count, args.max_posts)
             print(f"[run] posts collected: {len(posts)} (base={base_url})")
@@ -452,7 +483,16 @@ def main() -> None:
                     male_id = meta["male_id"]
                     last_rate = fetch_last_snapshot(db, female_id, male_id, None)
                     delta_5m = support_rate - last_rate if last_rate is not None else 0
-                    insert_snapshot(db, episode_id, female_id, male_id, None, support_rate, delta_5m)
+                    insert_snapshot(
+                        db,
+                        episode_id,
+                        female_id,
+                        male_id,
+                        None,
+                        support_rate,
+                        delta_5m,
+                        capture_time,
+                    )
                     snapshot_inserts += 1
                     if abs(delta_5m) >= args.event_threshold:
                         insert_event(db, episode_id, female_id, male_id, None, delta_5m)
@@ -464,7 +504,16 @@ def main() -> None:
                     target_id = meta["target_id"]
                     last_rate = fetch_last_snapshot(db, None, None, target_id)
                     delta_5m = support_rate - last_rate if last_rate is not None else 0
-                    insert_snapshot(db, episode_id, None, None, target_id, support_rate, delta_5m)
+                    insert_snapshot(
+                        db,
+                        episode_id,
+                        None,
+                        None,
+                        target_id,
+                        support_rate,
+                        delta_5m,
+                        capture_time,
+                    )
                     snapshot_inserts += 1
                     if abs(delta_5m) >= args.event_threshold:
                         insert_event(db, episode_id, None, None, target_id, delta_5m)

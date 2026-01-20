@@ -48,7 +48,7 @@ def _fetch_overview(
 
     history_rows = db.execute(
         text(
-            "SELECT captured_at, support_rate "
+            "SELECT captured_at, support_rate, episode_id "
             "FROM sentiment_snapshots "
             f"WHERE {condition} "
             "ORDER BY captured_at DESC LIMIT :limit"
@@ -149,7 +149,11 @@ def read_sentiment_overview(
             )
 
     history = [
-        SentimentPoint(captured_at=row.captured_at, support_rate=row.support_rate)
+        SentimentPoint(
+            captured_at=row.captured_at,
+            support_rate=row.support_rate,
+            episode_id=row.episode_id,
+        )
         for row in reversed(history_rows)
     ]
 
