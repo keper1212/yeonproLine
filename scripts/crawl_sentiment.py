@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -171,7 +172,7 @@ def gemini_analyze_all_targets_hourly(
             f"{GEMINI_ENDPOINT}?key={api_key}",
             headers={"Content-Type": "application/json"},
             data=json.dumps(payload),
-            timeout=90,
+            timeout=240,
         )
         res.raise_for_status()
         data = res.json()
@@ -352,6 +353,102 @@ def insert_summary(db, episode_id, female_id, male_id, target_id, summary_text):
     )
 
 
+def process_analysis(
+    db,
+    analysis: Optional[Dict],
+    combined_label_meta: Dict[str, Dict],
+    episode_id: Optional[int],
+    capture_time: datetime,
+    event_threshold: int,
+    save_summary: bool,
+    base_url: str,
+) -> Tuple[Dict[str, str], Dict[str, Dict]]:
+    if not analysis or not isinstance(analysis, dict):
+        print(f"[run] gemini analysis failed or empty (base={base_url})")
+        return {}, combined_label_meta
+
+    results_list = analysis.get("results", [])
+    results_map: Dict[str, Dict] = {}
+    for item in results_list:
+        if not isinstance(item, dict):
+            continue
+        label = item.get("label")
+        if not label:
+            continue
+        results_map[label] = item
+
+    snapshot_inserts = 0
+    event_inserts = 0
+    summary_inserts = 0
+
+    for label, meta in combined_label_meta.items():
+        result = results_map.get(label)
+        if not result:
+            continue
+        score = result.get("score")
+        if not isinstance(score, (int, float)):
+            continue
+        support_rate = max(0, min(100, int(round(score))))
+        summary = result.get("summary")
+        if meta["type"] == "pair":
+            female_id = meta["female_id"]
+            male_id = meta["male_id"]
+            last_rate = fetch_last_snapshot(db, female_id, male_id, None)
+            delta_5m = support_rate - last_rate if last_rate is not None else 0
+            insert_snapshot(
+                db,
+                episode_id,
+                female_id,
+                male_id,
+                None,
+                support_rate,
+                delta_5m,
+                capture_time,
+            )
+            snapshot_inserts += 1
+            if abs(delta_5m) >= event_threshold:
+                insert_event(db, episode_id, female_id, male_id, None, delta_5m)
+                event_inserts += 1
+            if isinstance(summary, str) and summary.strip() and save_summary:
+                insert_summary(db, episode_id, female_id, male_id, None, summary.strip())
+                summary_inserts += 1
+        else:
+            target_id = meta["target_id"]
+            last_rate = fetch_last_snapshot(db, None, None, target_id)
+            delta_5m = support_rate - last_rate if last_rate is not None else 0
+            insert_snapshot(
+                db,
+                episode_id,
+                None,
+                None,
+                target_id,
+                support_rate,
+                delta_5m,
+                capture_time,
+            )
+            snapshot_inserts += 1
+            if abs(delta_5m) >= event_threshold:
+                insert_event(db, episode_id, None, None, target_id, delta_5m)
+                event_inserts += 1
+            if isinstance(summary, str) and summary.strip() and save_summary:
+                insert_summary(db, episode_id, None, None, target_id, summary.strip())
+                summary_inserts += 1
+
+    db.commit()
+    print(
+        f"[db] commit ok: snapshots={snapshot_inserts}, "
+        f"events={event_inserts}, summaries={summary_inserts} "
+        f"(base={base_url})"
+    )
+
+    next_prior_summaries = {
+        label: item.get("summary")
+        for label, item in results_map.items()
+        if isinstance(item.get("summary"), str) and item.get("summary")
+    }
+    return next_prior_summaries, combined_label_meta
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -403,138 +500,92 @@ def main() -> None:
         total_urls = len(LIST_URLS)
 
         capture_time = episode_capture_time(db, episode_id)
-        for idx, (base_url, start_page) in enumerate(zip(LIST_URLS, pages_list)):
-            posts = crawl_posts(base_url, start_page, args.page_count, args.max_posts)
-            print(f"[run] posts collected: {len(posts)} (base={base_url})")
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = None
+            future_context: Dict[str, object] = {}
 
-            target_texts: Dict[str, List[str]] = defaultdict(list)
-            label_meta: Dict[str, Dict] = {}
+            for idx, (base_url, start_page) in enumerate(zip(LIST_URLS, pages_list)):
+                posts = crawl_posts(base_url, start_page, args.page_count, args.max_posts)
+                print(f"[run] posts collected: {len(posts)} (base={base_url})")
 
-            for post in posts:
-                text_content = post["text"]
-                females, males = detect_mentions(text_content, participants)
-                if females and males:
-                    for f in females:
-                        for m in males:
-                            label = f"{f['name']}♥{m['name']}"
+                target_texts: Dict[str, List[str]] = defaultdict(list)
+                label_meta: Dict[str, Dict] = {}
+
+                for post in posts:
+                    text_content = post["text"]
+                    females, males = detect_mentions(text_content, participants)
+                    if females and males:
+                        for f in females:
+                            for m in males:
+                                label = f"{f['name']}♥{m['name']}"
+                                target_texts[label].append(text_content)
+                                label_meta[label] = {
+                                    "type": "pair",
+                                    "female_id": f["id"],
+                                    "male_id": m["id"],
+                                }
+                    else:
+                        for t in (females or males):
+                            label = t["name"]
                             target_texts[label].append(text_content)
                             label_meta[label] = {
-                                "type": "pair",
-                                "female_id": f["id"],
-                                "male_id": m["id"],
+                                "type": "single",
+                                "target_id": t["id"],
                             }
-                else:
-                    for t in (females or males):
-                        label = t["name"]
-                        target_texts[label].append(text_content)
-                        label_meta[label] = {
-                            "type": "single",
-                            "target_id": t["id"],
-                        }
 
-            if not target_texts and not prior_summaries:
-                print(f"[run] no matched targets for base={base_url}")
-                continue
-
-            combined_texts: Dict[str, List[str]] = defaultdict(list)
-            combined_label_meta: Dict[str, Dict] = {}
-            combined_label_meta.update(prior_label_meta)
-            combined_label_meta.update(label_meta)
-            for label, texts in target_texts.items():
-                combined_texts[label].extend(texts)
-            for label in prior_summaries.keys():
-                combined_texts.setdefault(label, [])
-
-            print(f"[run] targets grouped: {len(combined_texts)} (base={base_url})")
-            analysis = gemini_analyze_all_targets_hourly(
-                api_key,
-                {label: {"texts": texts} for label, texts in combined_texts.items()},
-                prior_summaries=prior_summaries,
-            )
-            if not analysis or not isinstance(analysis, dict):
-                print(f"[run] gemini analysis failed or empty (base={base_url})")
-                continue
-
-            results_list = analysis.get("results", [])
-            results_map: Dict[str, Dict] = {}
-            for item in results_list:
-                if not isinstance(item, dict):
-                    continue
-                label = item.get("label")
-                if not label:
-                    continue
-                results_map[label] = item
-
-            snapshot_inserts = 0
-            event_inserts = 0
-            summary_inserts = 0
-
-            for label, meta in combined_label_meta.items():
-                result = results_map.get(label)
-                if not result:
-                    continue
-                score = result.get("score")
-                if not isinstance(score, (int, float)):
-                    continue
-                support_rate = max(0, min(100, int(round(score))))
-                summary = result.get("summary")
-                if meta["type"] == "pair":
-                    female_id = meta["female_id"]
-                    male_id = meta["male_id"]
-                    last_rate = fetch_last_snapshot(db, female_id, male_id, None)
-                    delta_5m = support_rate - last_rate if last_rate is not None else 0
-                    insert_snapshot(
+                if future is not None:
+                    analysis = future.result()
+                    prior_summaries, prior_label_meta = process_analysis(
                         db,
+                        analysis,
+                        future_context["combined_label_meta"],
                         episode_id,
-                        female_id,
-                        male_id,
-                        None,
-                        support_rate,
-                        delta_5m,
                         capture_time,
+                        args.event_threshold,
+                        bool(future_context["save_summary"]),
+                        str(future_context["base_url"]),
                     )
-                    snapshot_inserts += 1
-                    if abs(delta_5m) >= args.event_threshold:
-                        insert_event(db, episode_id, female_id, male_id, None, delta_5m)
-                        event_inserts += 1
-                    if isinstance(summary, str) and summary.strip() and idx == total_urls - 1:
-                        insert_summary(db, episode_id, female_id, male_id, None, summary.strip())
-                        summary_inserts += 1
-                else:
-                    target_id = meta["target_id"]
-                    last_rate = fetch_last_snapshot(db, None, None, target_id)
-                    delta_5m = support_rate - last_rate if last_rate is not None else 0
-                    insert_snapshot(
-                        db,
-                        episode_id,
-                        None,
-                        None,
-                        target_id,
-                        support_rate,
-                        delta_5m,
-                        capture_time,
-                    )
-                    snapshot_inserts += 1
-                    if abs(delta_5m) >= args.event_threshold:
-                        insert_event(db, episode_id, None, None, target_id, delta_5m)
-                        event_inserts += 1
-                    if isinstance(summary, str) and summary.strip() and idx == total_urls - 1:
-                        insert_summary(db, episode_id, None, None, target_id, summary.strip())
-                        summary_inserts += 1
 
-            prior_summaries = {
-                label: item.get("summary")
-                for label, item in results_map.items()
-                if isinstance(item.get("summary"), str) and item.get("summary")
-            }
-            prior_label_meta = combined_label_meta
+                if not target_texts and not prior_summaries:
+                    print(f"[run] no matched targets for base={base_url}")
+                    future = None
+                    future_context = {}
+                    continue
 
-            db.commit()
-            print(
-                f"[db] commit ok: snapshots={snapshot_inserts}, "
-                f"events={event_inserts}, summaries={summary_inserts} "
-                f"(base={base_url})"
-            )
+                combined_texts: Dict[str, List[str]] = defaultdict(list)
+                combined_label_meta: Dict[str, Dict] = {}
+                combined_label_meta.update(prior_label_meta)
+                combined_label_meta.update(label_meta)
+                for label, texts in target_texts.items():
+                    combined_texts[label].extend(texts)
+                for label in prior_summaries.keys():
+                    combined_texts.setdefault(label, [])
+
+                print(f"[run] targets grouped: {len(combined_texts)} (base={base_url})")
+                future = executor.submit(
+                    gemini_analyze_all_targets_hourly,
+                    api_key,
+                    {label: {"texts": texts} for label, texts in combined_texts.items()},
+                    prior_summaries=prior_summaries,
+                )
+                future_context = {
+                    "combined_label_meta": combined_label_meta,
+                    "save_summary": idx == total_urls - 1,
+                    "base_url": base_url,
+                }
+
+            if future is not None:
+                analysis = future.result()
+                process_analysis(
+                    db,
+                    analysis,
+                    future_context["combined_label_meta"],
+                    episode_id,
+                    capture_time,
+                    args.event_threshold,
+                    bool(future_context["save_summary"]),
+                    str(future_context["base_url"]),
+                )
     finally:
         db.close()
 

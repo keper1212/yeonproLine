@@ -9,6 +9,7 @@ from app.db.session import get_db
 from app.models.badge import BadgeMaster
 from app.models.episode import Episode
 from app.models.prediction import Prediction
+from app.models.prediction_item import PredictionItem as PredictionItemModel
 from app.models.user import User
 from app.models.user_badge import UserBadge
 from app.schemas.user import (
@@ -185,7 +186,10 @@ def read_prediction_history(
         db.query(
             Prediction.id,
             Prediction.episode_id,
+            Prediction.prediction_item_id,
             Prediction.prediction_type,
+            PredictionItemModel.question_text,
+            PredictionItemModel.category,
             Prediction.target_participant_id,
             Prediction.selected_value,
             Prediction.betting_points,
@@ -194,6 +198,10 @@ def read_prediction_history(
                 (Prediction.is_correct.is_(True), Prediction.betting_points),
                 else_=0,
             ).label("earned_points"),
+        )
+        .outerjoin(
+            PredictionItemModel,
+            Prediction.prediction_item_id == PredictionItemModel.id,
         )
         .filter(Prediction.user_id == current_user.id)
         .order_by(Prediction.episode_id, Prediction.id)
@@ -207,7 +215,10 @@ def read_prediction_history(
         episodes_map[row.episode_id].append(
             PredictionItem(
                 id=row.id,
+                prediction_item_id=row.prediction_item_id,
                 prediction_type=row.prediction_type,
+                question_text=row.question_text,
+                category=row.category,
                 target_participant_id=row.target_participant_id,
                 selected_value=row.selected_value,
                 betting_points=row.betting_points,

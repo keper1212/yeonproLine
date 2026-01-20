@@ -65,7 +65,10 @@ class AccuracyTrend(BaseModel):
 
 class PredictionItem(BaseModel):
     id: int
+    prediction_item_id: Optional[int] = None
     prediction_type: str
+    question_text: Optional[str] = None
+    category: Optional[str] = None
     target_participant_id: Optional[int] = None
     selected_value: str
     betting_points: int
