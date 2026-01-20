@@ -46,6 +46,7 @@ class PredictionsOverview(BaseModel):
     season_final_vote_open: bool
     season_couples_locked: bool
     season_couples: List[SeasonCouplePair] = Field(default_factory=list)
+    episode_predictions_locked: bool = False
     participants: List[ParticipantSummary] = Field(default_factory=list)
     episode_items: List[PredictionItemSummary] = Field(default_factory=list)
     season_final_zero_vote: Optional[int] = None

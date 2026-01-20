@@ -130,6 +130,17 @@ def crawl_posts(base_url: str, start_page: int, page_count: int, max_posts: int)
     return posts
 
 
+def page_sequence(start_page: int, page_count: int) -> List[int]:
+    pages: List[int] = []
+    current = start_page
+    for _ in range(page_count):
+        if current <= 0:
+            break
+        pages.append(current)
+        current -= 2
+    return pages
+
+
 def gemini_analyze_all_targets_hourly(
     api_key: str,
     target_data_map: Dict[str, Dict],
@@ -353,6 +364,40 @@ def insert_summary(db, episode_id, female_id, male_id, target_id, summary_text):
     )
 
 
+def insert_summaries_only(
+    db,
+    episode_id: Optional[int],
+    label_meta: Dict[str, Dict],
+    summaries: Dict[str, str],
+) -> int:
+    summary_inserts = 0
+    for label, meta in label_meta.items():
+        summary = summaries.get(label)
+        if not isinstance(summary, str) or not summary.strip():
+            continue
+        if meta["type"] == "pair":
+            insert_summary(
+                db,
+                episode_id,
+                meta["female_id"],
+                meta["male_id"],
+                None,
+                summary.strip(),
+            )
+        else:
+            insert_summary(
+                db,
+                episode_id,
+                None,
+                None,
+                meta["target_id"],
+                summary.strip(),
+            )
+        summary_inserts += 1
+    db.commit()
+    return summary_inserts
+
+
 def process_analysis(
     db,
     analysis: Optional[Dict],
@@ -501,91 +546,130 @@ def main() -> None:
 
         capture_time = episode_capture_time(db, episode_id)
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = None
-            future_context: Dict[str, object] = {}
+            pending_future = None
+            pending_context: Dict[str, object] = {}
 
-            for idx, (base_url, start_page) in enumerate(zip(LIST_URLS, pages_list)):
-                posts = crawl_posts(base_url, start_page, args.page_count, args.max_posts)
-                print(f"[run] posts collected: {len(posts)} (base={base_url})")
+            for url_idx, (base_url, start_page) in enumerate(zip(LIST_URLS, pages_list)):
+                page_numbers = page_sequence(start_page, args.page_count)
+                url_prior_summaries: Dict[str, str] = dict(prior_summaries)
+                url_prior_label_meta: Dict[str, Dict] = dict(prior_label_meta)
 
-                target_texts: Dict[str, List[str]] = defaultdict(list)
-                label_meta: Dict[str, Dict] = {}
+                for page_idx, page_number in enumerate(page_numbers):
+                    page_url = f"{base_url}&page={page_number}"
+                    html = _http_get(page_url)
+                    if not html:
+                        print(f"[crawl] list fetch failed: {page_url}")
+                        continue
+                    print(f"[crawl] list page: {page_url}")
+                    links = _parse_list_page(html, base_url)
+                    posts: List[Dict] = []
+                    for link in links:
+                        if len(posts) >= args.max_posts:
+                            print(f"[crawl] reached max_posts={args.max_posts}, stop crawling")
+                            break
+                        detail = _http_get(link)
+                        if not detail:
+                            print(f"[crawl] post fetch failed: {link}")
+                            continue
+                        parsed = _parse_post(detail)
+                        if parsed and parsed.get("text"):
+                            print(f"[crawl] fetched post: {link}")
+                            posts.append(parsed)
+                        else:
+                            print(f"[crawl] post parse failed: {link}")
+                        time.sleep(2.0)
 
-                for post in posts:
-                    text_content = post["text"]
-                    females, males = detect_mentions(text_content, participants)
-                    if females and males:
-                        for f in females:
-                            for m in males:
-                                label = f"{f['name']}♥{m['name']}"
+                    print(f"[run] posts collected: {len(posts)} (base={base_url})")
+                    target_texts: Dict[str, List[str]] = defaultdict(list)
+                    label_meta: Dict[str, Dict] = {}
+
+                    for post in posts:
+                        text_content = post["text"]
+                        females, males = detect_mentions(text_content, participants)
+                        if females and males:
+                            for f in females:
+                                for m in males:
+                                    label = f"{f['name']}♥{m['name']}"
+                                    target_texts[label].append(text_content)
+                                    label_meta[label] = {
+                                        "type": "pair",
+                                        "female_id": f["id"],
+                                        "male_id": m["id"],
+                                    }
+                        else:
+                            for t in (females or males):
+                                label = t["name"]
                                 target_texts[label].append(text_content)
                                 label_meta[label] = {
-                                    "type": "pair",
-                                    "female_id": f["id"],
-                                    "male_id": m["id"],
+                                    "type": "single",
+                                    "target_id": t["id"],
                                 }
-                    else:
-                        for t in (females or males):
-                            label = t["name"]
-                            target_texts[label].append(text_content)
-                            label_meta[label] = {
-                                "type": "single",
-                                "target_id": t["id"],
-                            }
 
-                if future is not None:
-                    analysis = future.result()
-                    prior_summaries, prior_label_meta = process_analysis(
+                    if pending_future is not None:
+                        analysis = pending_future.result()
+                        url_prior_summaries, url_prior_label_meta = process_analysis(
+                            db,
+                            analysis,
+                            pending_context["combined_label_meta"],
+                            episode_id,
+                            capture_time,
+                            args.event_threshold,
+                            bool(pending_context["save_summary"]),
+                            str(pending_context["base_url"]),
+                        )
+
+                    if not target_texts and not url_prior_summaries:
+                        print(f"[run] no matched targets for base={base_url}")
+                        pending_future = None
+                        pending_context = {}
+                        continue
+
+                    combined_texts: Dict[str, List[str]] = defaultdict(list)
+                    combined_label_meta: Dict[str, Dict] = {}
+                    combined_label_meta.update(url_prior_label_meta)
+                    combined_label_meta.update(label_meta)
+                    for label, texts in target_texts.items():
+                        combined_texts[label].extend(texts)
+                    for label in url_prior_summaries.keys():
+                        combined_texts.setdefault(label, [])
+
+                    print(f"[run] targets grouped: {len(combined_texts)} (base={base_url})")
+                    pending_future = executor.submit(
+                        gemini_analyze_all_targets_hourly,
+                        api_key,
+                        {label: {"texts": texts} for label, texts in combined_texts.items()},
+                        prior_summaries=url_prior_summaries,
+                    )
+                    pending_context = {
+                        "combined_label_meta": combined_label_meta,
+                        "save_summary": False,
+                        "base_url": base_url,
+                    }
+
+                if pending_future is not None:
+                    analysis = pending_future.result()
+                    url_prior_summaries, url_prior_label_meta = process_analysis(
                         db,
                         analysis,
-                        future_context["combined_label_meta"],
+                        pending_context["combined_label_meta"],
                         episode_id,
                         capture_time,
                         args.event_threshold,
-                        bool(future_context["save_summary"]),
-                        str(future_context["base_url"]),
+                        bool(pending_context["save_summary"]),
+                        str(pending_context["base_url"]),
                     )
 
-                if not target_texts and not prior_summaries:
-                    print(f"[run] no matched targets for base={base_url}")
-                    future = None
-                    future_context = {}
-                    continue
+                prior_summaries = dict(url_prior_summaries)
+                prior_label_meta = dict(url_prior_label_meta)
 
-                combined_texts: Dict[str, List[str]] = defaultdict(list)
-                combined_label_meta: Dict[str, Dict] = {}
-                combined_label_meta.update(prior_label_meta)
-                combined_label_meta.update(label_meta)
-                for label, texts in target_texts.items():
-                    combined_texts[label].extend(texts)
-                for label in prior_summaries.keys():
-                    combined_texts.setdefault(label, [])
-
-                print(f"[run] targets grouped: {len(combined_texts)} (base={base_url})")
-                future = executor.submit(
-                    gemini_analyze_all_targets_hourly,
-                    api_key,
-                    {label: {"texts": texts} for label, texts in combined_texts.items()},
-                    prior_summaries=prior_summaries,
-                )
-                future_context = {
-                    "combined_label_meta": combined_label_meta,
-                    "save_summary": idx == total_urls - 1,
-                    "base_url": base_url,
-                }
-
-            if future is not None:
-                analysis = future.result()
-                process_analysis(
+            if prior_summaries:
+                summary_inserts = insert_summaries_only(
                     db,
-                    analysis,
-                    future_context["combined_label_meta"],
                     episode_id,
-                    capture_time,
-                    args.event_threshold,
-                    bool(future_context["save_summary"]),
-                    str(future_context["base_url"]),
+                    prior_label_meta,
+                    prior_summaries,
                 )
+                print(f"[db] commit ok: summaries={summary_inserts} (base=final)")
     finally:
         db.close()
 

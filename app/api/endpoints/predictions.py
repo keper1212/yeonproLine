@@ -130,6 +130,17 @@ def get_predictions_overview(
             .order_by(PredictionItem.id.asc())
             .all()
         )
+    episode_predictions_locked = False
+    if next_episode:
+        episode_predictions_locked = (
+            db.query(Prediction)
+            .filter(
+                Prediction.user_id == current_user.id,
+                Prediction.episode_id == next_episode.id,
+            )
+            .first()
+            is not None
+        )
 
     final_zero_vote = (
         db.query(Prediction)
@@ -154,6 +165,7 @@ def get_predictions_overview(
         season_final_vote_open=season_final_vote_open,
         season_couples_locked=season_couples_locked,
         season_couples=season_couples,
+        episode_predictions_locked=episode_predictions_locked,
         participants=participants,
         episode_items=episode_items,
         season_final_zero_vote=int(final_zero_vote.selected_value)
