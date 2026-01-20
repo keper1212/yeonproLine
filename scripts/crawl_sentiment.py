@@ -6,7 +6,7 @@ import re
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 import requests
@@ -62,59 +62,102 @@ def _parse_list_page(html: str, base_url: str) -> List[str]:
     return links
 
 
-def _parse_post(html: str) -> Optional[str]:
+def _parse_post_datetime(text_value: str) -> Optional[datetime]:
+    if not text_value:
+        return None
+    match = re.search(r"(\\d{2,4})\\.(\\d{2})\\.(\\d{2})\\s+(\\d{2}):(\\d{2})", text_value)
+    if not match:
+        return None
+    year = int(match.group(1))
+    if year < 100:
+        year += 2000
+    month = int(match.group(2))
+    day = int(match.group(3))
+    hour = int(match.group(4))
+    minute = int(match.group(5))
+    try:
+        return datetime(year, month, day, hour, minute)
+    except ValueError:
+        return None
+
+
+def _parse_post(html: str) -> Optional[Dict]:
     soup = BeautifulSoup(html, "html.parser")
     title = soup.select_one(".title_subject") or soup.select_one("h3.title")
     body = soup.select_one(".write_div")
+    date_node = (
+        soup.select_one(".gall_date")
+        or soup.select_one("span.gall_date")
+        or soup.select_one(".date")
+    )
     if not title or not body:
         return None
     title_text = title.get_text(" ", strip=True)
     body_text = body.get_text(" ", strip=True)
     if not title_text and not body_text:
         return None
-    return f"{title_text}\n{body_text}"
+    created_at = _parse_post_datetime(date_node.get_text(strip=True)) if date_node else None
+    return {"text": f"{title_text}\n{body_text}", "created_at": created_at}
 
 
-def crawl_posts(pages: int, max_posts: int) -> List[str]:
-    posts: List[str] = []
-    for base in LIST_URLS:
-        print(f"[crawl] list base: {base}")
-        for page in range(1, pages + 1):
-            page_url = f"{base}&page={page}"
-            print(f"[crawl] list page: {page_url}")
-            html = _http_get(page_url)
-            if not html:
-                print(f"[crawl] list fetch failed: {page_url}")
+def crawl_posts(base_url: str, start_page: int, page_count: int, max_posts: int) -> List[Dict]:
+    posts: List[Dict] = []
+    print(f"[crawl] list base: {base_url}")
+    for page in range(start_page, max(start_page - page_count, 0), -1):
+        page_url = f"{base_url}&page={page}"
+        print(f"[crawl] list page: {page_url}")
+        html = _http_get(page_url)
+        if not html:
+            print(f"[crawl] list fetch failed: {page_url}")
+            continue
+        links = _parse_list_page(html, base_url)
+        for link in links:
+            if len(posts) >= max_posts:
+                print(f"[crawl] reached max_posts={max_posts}, stop crawling")
+                return posts
+            detail = _http_get(link)
+            if not detail:
+                print(f"[crawl] post fetch failed: {link}")
                 continue
-            links = _parse_list_page(html, base)
-            for link in links:
-                if len(posts) >= max_posts:
-                    print(f"[crawl] reached max_posts={max_posts}, stop crawling")
-                    return posts
-                detail = _http_get(link)
-                if not detail:
-                    print(f"[crawl] post fetch failed: {link}")
-                    continue
-                content = _parse_post(detail)
-                if content:
-                    print(f"[crawl] fetched post: {link}")
-                    posts.append(content)
-                else:
-                    print(f"[crawl] post parse failed: {link}")
-                time.sleep(2.0)
+            parsed = _parse_post(detail)
+            if parsed and parsed.get("text"):
+                print(f"[crawl] fetched post: {link}")
+                posts.append(parsed)
+            else:
+                print(f"[crawl] post parse failed: {link}")
+            time.sleep(2.0)
     return posts
 
 
-def gemini_classify(api_key: str, target_label: str, text: str) -> Optional[int]:
+def gemini_analyze_all_targets_hourly(
+    api_key: str,
+    target_data_map: Dict[str, Dict],
+    prior_summaries: Optional[Dict[str, str]] = None,
+) -> Optional[Dict]:
     prompt = (
-        "You are a Korean sentiment classifier.\n"
-        f"Target: {target_label}\n"
-        "Classify the sentiment toward the target as one of:\n"
-        "-1 (negative), 0 (neutral), 1 (positive)\n"
-        "Return ONLY JSON like: {\"sentiment\": -1}\n"
-        "Text:\n"
-        f"{text}\n"
+        "다음은 특정 페이지 범위에서 수집된 커뮤니티 글입니다.\n"
+        "대상별 텍스트 묶음을 읽고, 각 대상에 대한 대중의 호감도를 0~100 사이 숫자로 평가하세요.\n"
+        "점수는 언급 빈도, 긍/부정 뉘앙스, 비판/옹호 강도를 종합적으로 반영해야 합니다.\n"
+        "이전에 생성된 요약이 제공되면, 새 텍스트와 함께 통합된 최종 요약(1~2문장)을 작성하세요.\n"
+        "새 텍스트가 없더라도 이전 요약을 기반으로 자연스럽게 유지 요약을 작성하세요.\n"
+        "반드시 아래 JSON 형식만 반환하세요.\n"
+        "{\n"
+        "  \"results\": [\n"
+        "    {\"label\": \"지우♥민수\", \"score\": 78, \"summary\": \"...\"}\n"
+        "  ]\n"
+        "}\n"
+        "대상별 텍스트:\n"
     )
+    prior_summaries = prior_summaries or {}
+    for label, data in target_data_map.items():
+        joined = "\n\n".join(data["texts"]) if data.get("texts") else ""
+        prior = prior_summaries.get(label)
+        prompt += f"[{label}]\n"
+        if prior:
+            prompt += f"이전 요약: {prior}\n"
+        prompt += "새 텍스트:\n"
+        prompt += f"{joined if joined else '(없음)'}\n---\n"
+
     payload = {
         "contents": [
             {
@@ -128,60 +171,7 @@ def gemini_classify(api_key: str, target_label: str, text: str) -> Optional[int]
             f"{GEMINI_ENDPOINT}?key={api_key}",
             headers={"Content-Type": "application/json"},
             data=json.dumps(payload),
-            timeout=30,
-        )
-        res.raise_for_status()
-        data = res.json()
-        text_out = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        if text_out.startswith("```"):
-            text_out = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", text_out).strip()
-        parsed = json.loads(text_out)
-        return int(parsed["sentiment"])
-    except Exception as exc:
-        status = getattr(locals().get("res", None), "status_code", None)
-        body = getattr(locals().get("res", None), "text", None)
-        print(
-            f"[gemini] classify failed target={target_label} "
-            f"status={status} error={exc}"
-        )
-        if body:
-            print(f"[gemini] classify response: {body[:500]}")
-        return None
-
-
-def gemini_batch_classify(api_key: str, items: List[Dict]) -> Optional[Dict]:
-    prompt = (
-        "You are a Korean sentiment classifier.\n"
-        "For each post, evaluate sentiment toward each target label provided.\n"
-        "Sentiment values must be one of: -1 (negative), 0 (neutral), 1 (positive).\n"
-        "Return ONLY JSON in this exact schema:\n"
-        "{\"results\": [{\"post_id\": 1, \"targets\": [{\"label\": \"A♥B\", \"sentiment\": -1}]}]}\n"
-        "Rules:\n"
-        "- Include every target label listed for each post.\n"
-        "- Do not add extra fields or text.\n"
-        "Posts:\n"
-    )
-    for item in items:
-        targets = [t["label"] for t in item["targets"]]
-        prompt += (
-            f"post_id: {item['post_id']}\n"
-            f"targets: {targets}\n"
-            f"text:\n{item['text']}\n---\n"
-        )
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ]
-    }
-    try:
-        res = requests.post(
-            f"{GEMINI_ENDPOINT}?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(payload),
-            timeout=60,
+            timeout=90,
         )
         res.raise_for_status()
         data = res.json()
@@ -192,46 +182,9 @@ def gemini_batch_classify(api_key: str, items: List[Dict]) -> Optional[Dict]:
     except Exception as exc:
         status = getattr(locals().get("res", None), "status_code", None)
         body = getattr(locals().get("res", None), "text", None)
-        print(f"[gemini] batch classify failed status={status} error={exc}")
+        print(f"[gemini] hourly analysis failed status={status} error={exc}")
         if body:
-            print(f"[gemini] batch classify response: {body[:500]}")
-        return None
-
-
-def gemini_summary(api_key: str, target_label: str, texts: List[str]) -> Optional[str]:
-    joined = "\n\n".join(texts[:20])
-    prompt = (
-        "You are a Korean social sentiment summarizer.\n"
-        f"Target: {target_label}\n"
-        "Summarize the community sentiment in 2-3 sentences.\n"
-        "Return plain Korean text only.\n"
-        "Texts:\n"
-        f"{joined}\n"
-    )
-    payload = {
-        "contents": [
-            {"role": "user", "parts": [{"text": prompt}]}
-        ]
-    }
-    try:
-        res = requests.post(
-            f"{GEMINI_ENDPOINT}?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(payload),
-            timeout=30,
-        )
-        res.raise_for_status()
-        data = res.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception as exc:
-        status = getattr(locals().get("res", None), "status_code", None)
-        body = getattr(locals().get("res", None), "text", None)
-        print(
-            f"[gemini] summary failed target={target_label} "
-            f"status={status} error={exc}"
-        )
-        if body:
-            print(f"[gemini] summary response: {body[:500]}")
+            print(f"[gemini] hourly analysis response: {body[:500]}")
         return None
 
 
@@ -372,9 +325,20 @@ def insert_summary(db, episode_id, female_id, male_id, target_id, summary_text):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pages", type=int, default=1)
+    parser.add_argument(
+        "--pages",
+        type=str,
+        default="1",
+        help="시작 페이지. 단일 값 또는 CSV 형식(예: 220,120).",
+    )
+    parser.add_argument(
+        "--page-count",
+        type=int,
+        default=5,
+        help="각 URL에서 시작 페이지부터 읽을 페이지 수.",
+    )
     parser.add_argument("--event-threshold", type=int, default=5)
-    parser.add_argument("--max-posts", type=int, default=20)
+    parser.add_argument("--max-posts", type=int, default=200)
     args = parser.parse_args()
 
     api_key = os.getenv("GEMINI_API_KEY")
@@ -383,150 +347,145 @@ def main() -> None:
 
     participants = load_participants()
     print(f"[run] participants loaded: {len(participants)}")
-    posts = crawl_posts(args.pages, args.max_posts)
-    print(f"[run] posts collected: {len(posts)}")
 
-    pair_scores: Dict[Tuple[int, int], List[int]] = defaultdict(list)
-    single_scores: Dict[int, List[int]] = defaultdict(list)
-    pair_texts: Dict[Tuple[int, int], List[str]] = defaultdict(list)
-    single_texts: Dict[int, List[str]] = defaultdict(list)
-
-    classify_attempts = 0
-    classify_failures = 0
-    matched_posts = 0
-    items: List[Dict] = []
-
-    for idx, text_content in enumerate(posts, start=1):
-        females, males = detect_mentions(text_content, participants)
-        targets: List[Dict] = []
-        if females and males:
-            for f in females:
-                for m in males:
-                    targets.append(
-                        {
-                            "type": "pair",
-                            "female_id": f["id"],
-                            "male_id": m["id"],
-                            "label": f"{f['name']}♥{m['name']}",
-                        }
-                    )
-        else:
-            targets = [
-                {
-                    "type": "single",
-                    "target_id": t["id"],
-                    "label": t["name"],
-                }
-                for t in (females or males)
-            ]
-
-        if targets:
-            matched_posts += 1
-            classify_attempts += len(targets)
-            items.append(
-                {
-                    "post_id": idx,
-                    "text": text_content,
-                    "targets": targets,
-                }
+    def parse_pages(value: str, url_count: int) -> List[int]:
+        items = [v.strip() for v in value.split(",") if v.strip()]
+        try:
+            pages = [int(v) for v in items] if items else [1]
+        except ValueError:
+            raise SystemExit("--pages는 숫자 또는 CSV 숫자 형식이어야 합니다.")
+        if len(pages) == 1:
+            return pages * url_count
+        if len(pages) != url_count:
+            raise SystemExit(
+                f"--pages 개수({len(pages)})가 URL 개수({url_count})와 일치해야 합니다."
             )
+        return pages
 
-    print(f"[run] matched posts: {matched_posts}")
-    print(f"[run] classify attempts: {classify_attempts}")
-
-    results_map: Dict[int, Dict[str, int]] = {}
-    if items:
-        batch_size = 10
-        for start in range(0, len(items), batch_size):
-            batch = items[start:start + batch_size]
-            print(
-                f"[run] classify batch {start // batch_size + 1} "
-                f"size={len(batch)}"
-            )
-            results = gemini_batch_classify(api_key, batch)
-            if not results or not isinstance(results, dict):
-                classify_failures += sum(len(i["targets"]) for i in batch)
-                continue
-            for entry in results.get("results", []):
-                post_id = entry.get("post_id")
-                targets = entry.get("targets", [])
-                if post_id is None:
-                    continue
-                results_map[int(post_id)] = {
-                    t.get("label"): int(t.get("sentiment"))
-                    for t in targets
-                    if isinstance(t, dict) and "label" in t and "sentiment" in t
-                }
-
-    for item in items:
-        post_id = item["post_id"]
-        sentiments = results_map.get(post_id, {})
-        for target in item["targets"]:
-            label = target["label"]
-            sentiment = sentiments.get(label)
-            if sentiment not in (-1, 0, 1):
-                classify_failures += 1
-                continue
-            if target["type"] == "pair":
-                key = (target["female_id"], target["male_id"])
-                pair_scores[key].append(sentiment)
-                pair_texts[key].append(item["text"])
-            else:
-                key = target["target_id"]
-                single_scores[key].append(sentiment)
-                single_texts[key].append(item["text"])
-
-    print(f"[run] classify failures: {classify_failures}")
+    pages_list = parse_pages(args.pages, len(LIST_URLS))
 
     db = SessionLocal()
     try:
         episode_id = current_episode_id(db)
         print(f"[db] current episode id: {episode_id}")
-        snapshot_inserts = 0
-        event_inserts = 0
-        summary_inserts = 0
+        prior_summaries: Dict[str, str] = {}
+        prior_label_meta: Dict[str, Dict] = {}
+        total_urls = len(LIST_URLS)
 
-        for (female_id, male_id), scores in pair_scores.items():
-            positives = sum(1 for s in scores if s > 0)
-            negatives = sum(1 for s in scores if s < 0)
-            total = positives + negatives
-            support_rate = int(round((positives / total) * 100)) if total else 0
-            last_rate = fetch_last_snapshot(db, female_id, male_id, None)
-            delta_5m = support_rate - last_rate if last_rate is not None else 0
-            insert_snapshot(db, episode_id, female_id, male_id, None, support_rate, delta_5m)
-            snapshot_inserts += 1
-            if abs(delta_5m) >= args.event_threshold:
-                insert_event(db, episode_id, female_id, male_id, None, delta_5m)
-                event_inserts += 1
+        for idx, (base_url, start_page) in enumerate(zip(LIST_URLS, pages_list)):
+            posts = crawl_posts(base_url, start_page, args.page_count, args.max_posts)
+            print(f"[run] posts collected: {len(posts)} (base={base_url})")
 
-            summary = gemini_summary(api_key, f"{female_id}-{male_id}", pair_texts[(female_id, male_id)])
-            if summary:
-                insert_summary(db, episode_id, female_id, male_id, None, summary)
-                summary_inserts += 1
+            target_texts: Dict[str, List[str]] = defaultdict(list)
+            label_meta: Dict[str, Dict] = {}
 
-        for target_id, scores in single_scores.items():
-            positives = sum(1 for s in scores if s > 0)
-            negatives = sum(1 for s in scores if s < 0)
-            total = positives + negatives
-            support_rate = int(round((positives / total) * 100)) if total else 0
-            last_rate = fetch_last_snapshot(db, None, None, target_id)
-            delta_5m = support_rate - last_rate if last_rate is not None else 0
-            insert_snapshot(db, episode_id, None, None, target_id, support_rate, delta_5m)
-            snapshot_inserts += 1
-            if abs(delta_5m) >= args.event_threshold:
-                insert_event(db, episode_id, None, None, target_id, delta_5m)
-                event_inserts += 1
+            for post in posts:
+                text_content = post["text"]
+                females, males = detect_mentions(text_content, participants)
+                if females and males:
+                    for f in females:
+                        for m in males:
+                            label = f"{f['name']}♥{m['name']}"
+                            target_texts[label].append(text_content)
+                            label_meta[label] = {
+                                "type": "pair",
+                                "female_id": f["id"],
+                                "male_id": m["id"],
+                            }
+                else:
+                    for t in (females or males):
+                        label = t["name"]
+                        target_texts[label].append(text_content)
+                        label_meta[label] = {
+                            "type": "single",
+                            "target_id": t["id"],
+                        }
 
-            summary = gemini_summary(api_key, f"participant-{target_id}", single_texts[target_id])
-            if summary:
-                insert_summary(db, episode_id, None, None, target_id, summary)
-                summary_inserts += 1
+            if not target_texts and not prior_summaries:
+                print(f"[run] no matched targets for base={base_url}")
+                continue
 
-        db.commit()
-        print(
-            f"[db] commit ok: snapshots={snapshot_inserts}, "
-            f"events={event_inserts}, summaries={summary_inserts}"
-        )
+            combined_texts: Dict[str, List[str]] = defaultdict(list)
+            combined_label_meta: Dict[str, Dict] = {}
+            combined_label_meta.update(prior_label_meta)
+            combined_label_meta.update(label_meta)
+            for label, texts in target_texts.items():
+                combined_texts[label].extend(texts)
+            for label in prior_summaries.keys():
+                combined_texts.setdefault(label, [])
+
+            print(f"[run] targets grouped: {len(combined_texts)} (base={base_url})")
+            analysis = gemini_analyze_all_targets_hourly(
+                api_key,
+                {label: {"texts": texts} for label, texts in combined_texts.items()},
+                prior_summaries=prior_summaries,
+            )
+            if not analysis or not isinstance(analysis, dict):
+                print(f"[run] gemini analysis failed or empty (base={base_url})")
+                continue
+
+            results_list = analysis.get("results", [])
+            results_map: Dict[str, Dict] = {}
+            for item in results_list:
+                if not isinstance(item, dict):
+                    continue
+                label = item.get("label")
+                if not label:
+                    continue
+                results_map[label] = item
+
+            snapshot_inserts = 0
+            event_inserts = 0
+            summary_inserts = 0
+
+            for label, meta in combined_label_meta.items():
+                result = results_map.get(label)
+                if not result:
+                    continue
+                score = result.get("score")
+                if not isinstance(score, (int, float)):
+                    continue
+                support_rate = max(0, min(100, int(round(score))))
+                summary = result.get("summary")
+                if meta["type"] == "pair":
+                    female_id = meta["female_id"]
+                    male_id = meta["male_id"]
+                    last_rate = fetch_last_snapshot(db, female_id, male_id, None)
+                    delta_5m = support_rate - last_rate if last_rate is not None else 0
+                    insert_snapshot(db, episode_id, female_id, male_id, None, support_rate, delta_5m)
+                    snapshot_inserts += 1
+                    if abs(delta_5m) >= args.event_threshold:
+                        insert_event(db, episode_id, female_id, male_id, None, delta_5m)
+                        event_inserts += 1
+                    if isinstance(summary, str) and summary.strip() and idx == total_urls - 1:
+                        insert_summary(db, episode_id, female_id, male_id, None, summary.strip())
+                        summary_inserts += 1
+                else:
+                    target_id = meta["target_id"]
+                    last_rate = fetch_last_snapshot(db, None, None, target_id)
+                    delta_5m = support_rate - last_rate if last_rate is not None else 0
+                    insert_snapshot(db, episode_id, None, None, target_id, support_rate, delta_5m)
+                    snapshot_inserts += 1
+                    if abs(delta_5m) >= args.event_threshold:
+                        insert_event(db, episode_id, None, None, target_id, delta_5m)
+                        event_inserts += 1
+                    if isinstance(summary, str) and summary.strip() and idx == total_urls - 1:
+                        insert_summary(db, episode_id, None, None, target_id, summary.strip())
+                        summary_inserts += 1
+
+            prior_summaries = {
+                label: item.get("summary")
+                for label, item in results_map.items()
+                if isinstance(item.get("summary"), str) and item.get("summary")
+            }
+            prior_label_meta = combined_label_meta
+
+            db.commit()
+            print(
+                f"[db] commit ok: snapshots={snapshot_inserts}, "
+                f"events={event_inserts}, summaries={summary_inserts} "
+                f"(base={base_url})"
+            )
     finally:
         db.close()
 
