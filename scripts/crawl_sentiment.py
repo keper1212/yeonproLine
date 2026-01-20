@@ -90,6 +90,7 @@ def crawl_posts(pages: int) -> List[str]:
                     continue
                 content = _parse_post(detail)
                 if content:
+                    print(f"[crawl] fetched post: {link}")
                     posts.append(content)
                 time.sleep(2.0)
     return posts
