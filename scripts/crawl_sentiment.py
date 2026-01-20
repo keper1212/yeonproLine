@@ -27,8 +27,8 @@ USER_AGENT = (
 )
 
 GEMINI_ENDPOINT = (
-    "https://generativelanguage.googleapis.com/v1beta/"
-    "models/gemini-1.5-flash:generateContent"
+    "https://generativelanguage.googleapis.com/v1/"
+    "models/gemini-2.5-flash:generateContent"
 )
 
 
@@ -132,10 +132,69 @@ def gemini_classify(api_key: str, target_label: str, text: str) -> Optional[int]
         )
         res.raise_for_status()
         data = res.json()
-        text_out = data["candidates"][0]["content"]["parts"][0]["text"]
-        parsed = json.loads(text_out.strip())
+        text_out = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        if text_out.startswith("```"):
+            text_out = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", text_out).strip()
+        parsed = json.loads(text_out)
         return int(parsed["sentiment"])
-    except Exception:
+    except Exception as exc:
+        status = getattr(locals().get("res", None), "status_code", None)
+        body = getattr(locals().get("res", None), "text", None)
+        print(
+            f"[gemini] classify failed target={target_label} "
+            f"status={status} error={exc}"
+        )
+        if body:
+            print(f"[gemini] classify response: {body[:500]}")
+        return None
+
+
+def gemini_batch_classify(api_key: str, items: List[Dict]) -> Optional[Dict]:
+    prompt = (
+        "You are a Korean sentiment classifier.\n"
+        "For each post, evaluate sentiment toward each target label provided.\n"
+        "Sentiment values must be one of: -1 (negative), 0 (neutral), 1 (positive).\n"
+        "Return ONLY JSON in this exact schema:\n"
+        "{\"results\": [{\"post_id\": 1, \"targets\": [{\"label\": \"A♥B\", \"sentiment\": -1}]}]}\n"
+        "Rules:\n"
+        "- Include every target label listed for each post.\n"
+        "- Do not add extra fields or text.\n"
+        "Posts:\n"
+    )
+    for item in items:
+        targets = [t["label"] for t in item["targets"]]
+        prompt += (
+            f"post_id: {item['post_id']}\n"
+            f"targets: {targets}\n"
+            f"text:\n{item['text']}\n---\n"
+        )
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ]
+    }
+    try:
+        res = requests.post(
+            f"{GEMINI_ENDPOINT}?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload),
+            timeout=60,
+        )
+        res.raise_for_status()
+        data = res.json()
+        text_out = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        if text_out.startswith("```"):
+            text_out = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", text_out).strip()
+        return json.loads(text_out)
+    except Exception as exc:
+        status = getattr(locals().get("res", None), "status_code", None)
+        body = getattr(locals().get("res", None), "text", None)
+        print(f"[gemini] batch classify failed status={status} error={exc}")
+        if body:
+            print(f"[gemini] batch classify response: {body[:500]}")
         return None
 
 
@@ -164,7 +223,15 @@ def gemini_summary(api_key: str, target_label: str, texts: List[str]) -> Optiona
         res.raise_for_status()
         data = res.json()
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception:
+    except Exception as exc:
+        status = getattr(locals().get("res", None), "status_code", None)
+        body = getattr(locals().get("res", None), "text", None)
+        print(
+            f"[gemini] summary failed target={target_label} "
+            f"status={status} error={exc}"
+        )
+        if body:
+            print(f"[gemini] summary response: {body[:500]}")
         return None
 
 
@@ -179,15 +246,36 @@ def load_participants() -> List[Dict]:
         db.close()
 
 
+def _name_variants(name: str) -> List[str]:
+    variants = []
+    if not name:
+        return variants
+    name = name.strip()
+    if not name:
+        return variants
+    variants.append(name)
+    if " " in name:
+        last_token = name.split()[-1].strip()
+        if len(last_token) >= 2:
+            variants.append(last_token)
+    if len(name) >= 3:
+        given = name[1:]
+        if len(given) >= 2:
+            variants.append(given)
+    return list(dict.fromkeys(variants))
+
+
 def detect_mentions(text: str, participants: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     females = []
     males = []
     for p in participants:
-        if p["name"] and p["name"] in text:
-            if p["gender"] == "female":
-                females.append(p)
-            elif p["gender"] == "male":
-                males.append(p)
+        for variant in _name_variants(p["name"]):
+            if variant in text:
+                if p["gender"] == "female":
+                    females.append(p)
+                elif p["gender"] == "male":
+                    males.append(p)
+                break
     return females, males
 
 
@@ -286,7 +374,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pages", type=int, default=1)
     parser.add_argument("--event-threshold", type=int, default=5)
-    parser.add_argument("--max-posts", type=int, default=5)
+    parser.add_argument("--max-posts", type=int, default=20)
     args = parser.parse_args()
 
     api_key = os.getenv("GEMINI_API_KEY")
@@ -306,35 +394,89 @@ def main() -> None:
     classify_attempts = 0
     classify_failures = 0
     matched_posts = 0
+    items: List[Dict] = []
 
-    for text_content in posts:
+    for idx, text_content in enumerate(posts, start=1):
         females, males = detect_mentions(text_content, participants)
+        targets: List[Dict] = []
         if females and males:
-            matched_posts += 1
             for f in females:
                 for m in males:
-                    label = f"{f['name']}♥{m['name']}"
-                    classify_attempts += 1
-                    sentiment = gemini_classify(api_key, label, text_content)
-                    if sentiment is None:
-                        classify_failures += 1
-                        continue
-                    pair_scores[(f["id"], m["id"])].append(sentiment)
-                    pair_texts[(f["id"], m["id"])].append(text_content)
+                    targets.append(
+                        {
+                            "type": "pair",
+                            "female_id": f["id"],
+                            "male_id": m["id"],
+                            "label": f"{f['name']}♥{m['name']}",
+                        }
+                    )
         else:
-            targets = females or males
-            for t in targets:
-                matched_posts += 1
-                classify_attempts += 1
-                sentiment = gemini_classify(api_key, t["name"], text_content)
-                if sentiment is None:
-                    classify_failures += 1
-                    continue
-                single_scores[t["id"]].append(sentiment)
-                single_texts[t["id"]].append(text_content)
+            targets = [
+                {
+                    "type": "single",
+                    "target_id": t["id"],
+                    "label": t["name"],
+                }
+                for t in (females or males)
+            ]
+
+        if targets:
+            matched_posts += 1
+            classify_attempts += len(targets)
+            items.append(
+                {
+                    "post_id": idx,
+                    "text": text_content,
+                    "targets": targets,
+                }
+            )
 
     print(f"[run] matched posts: {matched_posts}")
-    print(f"[run] classify attempts: {classify_attempts}, failures: {classify_failures}")
+    print(f"[run] classify attempts: {classify_attempts}")
+
+    results_map: Dict[int, Dict[str, int]] = {}
+    if items:
+        batch_size = 10
+        for start in range(0, len(items), batch_size):
+            batch = items[start:start + batch_size]
+            print(
+                f"[run] classify batch {start // batch_size + 1} "
+                f"size={len(batch)}"
+            )
+            results = gemini_batch_classify(api_key, batch)
+            if not results or not isinstance(results, dict):
+                classify_failures += sum(len(i["targets"]) for i in batch)
+                continue
+            for entry in results.get("results", []):
+                post_id = entry.get("post_id")
+                targets = entry.get("targets", [])
+                if post_id is None:
+                    continue
+                results_map[int(post_id)] = {
+                    t.get("label"): int(t.get("sentiment"))
+                    for t in targets
+                    if isinstance(t, dict) and "label" in t and "sentiment" in t
+                }
+
+    for item in items:
+        post_id = item["post_id"]
+        sentiments = results_map.get(post_id, {})
+        for target in item["targets"]:
+            label = target["label"]
+            sentiment = sentiments.get(label)
+            if sentiment not in (-1, 0, 1):
+                classify_failures += 1
+                continue
+            if target["type"] == "pair":
+                key = (target["female_id"], target["male_id"])
+                pair_scores[key].append(sentiment)
+                pair_texts[key].append(item["text"])
+            else:
+                key = target["target_id"]
+                single_scores[key].append(sentiment)
+                single_texts[key].append(item["text"])
+
+    print(f"[run] classify failures: {classify_failures}")
 
     db = SessionLocal()
     try:
