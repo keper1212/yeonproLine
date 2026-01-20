@@ -126,7 +126,7 @@ def crawl_posts(base_url: str, start_page: int, page_count: int, max_posts: int)
                 posts.append(parsed)
             else:
                 print(f"[crawl] post parse failed: {link}")
-            time.sleep(2.0)
+            time.sleep(1.5)
     return posts
 
 
