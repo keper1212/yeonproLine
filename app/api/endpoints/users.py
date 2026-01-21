@@ -229,6 +229,8 @@ def _award_badges(db: Session, user: User) -> None:
     )
     ratio_map: dict[tuple[int, str], float] = {}
     for item_id, selected_value, count in value_counts:
+        if item_id is None:
+            continue
         total = total_counts.get(item_id, 0)
         if total:
             ratio_map[(int(item_id), str(selected_value))] = count / total
@@ -240,6 +242,8 @@ def _award_badges(db: Session, user: User) -> None:
         .all()
     )
     for item_id, selected_value in user_correct:
+        if item_id is None:
+            continue
         ratio = ratio_map.get((int(item_id), str(selected_value)))
         if ratio is not None and ratio < 0.2:
             rare_correct += 1
