@@ -16,6 +16,7 @@ from app.schemas.prediction import (
     AdminSeasonFinalSubmit,
     EpisodePredictionsSubmit,
     PredictionAnswer,
+    PredictionItemSummary,
     PredictionsOverview,
     SeasonCouplePair,
     SeasonCouplesSubmit,
@@ -61,6 +62,39 @@ def _ensure_admin(current_user: User) -> None:
     if current_user.id != 1:
         raise HTTPException(status_code=403, detail="Admin only")
 
+
+def _special_odds_map(
+    db: Session,
+    episode_id: int,
+    prediction_item_id: int,
+) -> dict[str, float]:
+    predictions = (
+        db.query(Prediction)
+        .filter(
+            Prediction.prediction_item_id == prediction_item_id,
+            Prediction.episode_id == episode_id,
+        )
+        .all()
+    )
+    totals: dict[str, int] = {"yes": 0, "no": 0}
+    total_points = 0
+    for prediction in predictions:
+        selected = prediction.selected_value
+        if selected not in totals:
+            continue
+        points = int(prediction.betting_points or 0)
+        totals[selected] += points
+        total_points += points
+
+    if total_points <= 0:
+        return {"yes": 2.0, "no": 2.0}
+
+    odds_map: dict[str, float] = {}
+    for key in ("yes", "no"):
+        bet = totals.get(key, 0)
+        denom = bet if bet > 0 else 1
+        odds_map[key] = round(total_points / denom, 2)
+    return odds_map
 
 def _apply_prediction_result(
     db: Session,
@@ -146,9 +180,9 @@ def get_predictions_overview(
 
     season_couples_locked = len(season_couples) > 0
 
-    episode_items = []
+    episode_items: list[PredictionItemSummary] = []
     if next_episode:
-        episode_items = (
+        items = (
             db.query(PredictionItem)
             .filter(
                 PredictionItem.scope == "episode",
@@ -157,6 +191,23 @@ def get_predictions_overview(
             .order_by(PredictionItem.id.asc())
             .all()
         )
+        for item in items:
+            odds_by_value = None
+            if item.is_special:
+                odds_by_value = _special_odds_map(db, next_episode.id, item.id)
+            episode_items.append(
+                PredictionItemSummary(
+                    id=item.id,
+                    episode_id=item.episode_id,
+                    category=item.category,
+                    question_text=item.question_text,
+                    odds=item.odds,
+                    odds_by_value=odds_by_value,
+                    is_multiple_choice=item.is_multiple_choice,
+                    scope=item.scope,
+                    is_special=item.is_special,
+                )
+            )
     episode_answers = []
     if next_episode:
         episode_answers = [
@@ -164,6 +215,7 @@ def get_predictions_overview(
                 prediction_item_id=row.prediction_item_id,
                 selected_value=row.selected_value,
                 target_participant_id=row.target_participant_id,
+                betting_points=int(row.betting_points or 0),
             )
             for row in db.query(Prediction)
             .filter(
@@ -362,6 +414,8 @@ def submit_episode_predictions(
     if found_ids != {answer.prediction_item_id for answer in payload.answers}:
         raise HTTPException(status_code=400, detail="Invalid prediction items")
 
+    item_map = {item.id: item for item in items}
+
     existing = (
         db.query(Prediction)
         .filter(
@@ -375,6 +429,13 @@ def submit_episode_predictions(
         raise HTTPException(status_code=409, detail="Predictions already submitted")
 
     for answer in payload.answers:
+        item = item_map.get(answer.prediction_item_id)
+        betting_points = 0
+        if item and item.is_special:
+            if answer.betting_points is not None:
+                betting_points = int(answer.betting_points)
+            if betting_points < 0:
+                raise HTTPException(status_code=400, detail="Invalid betting points")
         db.add(
             Prediction(
                 user_id=current_user.id,
@@ -383,6 +444,7 @@ def submit_episode_predictions(
                 prediction_type="episode_prediction",
                 target_participant_id=answer.target_participant_id,
                 selected_value=answer.selected_value,
+                betting_points=betting_points,
             )
         )
     db.commit()
@@ -593,6 +655,10 @@ def submit_admin_episode_results(
         special_item_ids = [
             item.id for item in item_by_id.values() if item.is_special
         ]
+        odds_by_item = {
+            item_id: _special_odds_map(db, payload.episode_id, item_id)
+            for item_id in special_item_ids
+        }
         predictions = (
             db.query(Prediction)
             .filter(
@@ -603,11 +669,19 @@ def submit_admin_episode_results(
         )
         for prediction in predictions:
             correct = special_values.get(str(prediction.prediction_item_id))
+            is_correct = prediction.selected_value == correct
+            odds_map = odds_by_item.get(prediction.prediction_item_id, {"yes": 2.0, "no": 2.0})
+            selected_odds = odds_map.get(prediction.selected_value, 2.0)
+            payout = (
+                int(round(int(prediction.betting_points or 0) * selected_odds))
+                if is_correct
+                else 0
+            )
             _apply_prediction_result(
                 db,
                 prediction,
-                prediction.selected_value == correct,
-                int(prediction.betting_points or 0),
+                is_correct,
+                payout,
             )
 
     db.commit()

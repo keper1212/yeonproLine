@@ -31,6 +31,7 @@ class PredictionAnswer(BaseModel):
     prediction_item_id: int
     selected_value: str
     target_participant_id: Optional[int] = None
+    betting_points: Optional[int] = None
 
 
 class PredictionItemSummary(BaseModel):
@@ -41,6 +42,7 @@ class PredictionItemSummary(BaseModel):
     category: Optional[str] = None
     question_text: str
     odds: Optional[float] = None
+    odds_by_value: Optional[dict[str, float]] = None
     is_multiple_choice: bool = False
     scope: Optional[str] = None
     is_special: bool = False
