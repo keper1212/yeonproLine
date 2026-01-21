@@ -11,6 +11,9 @@ from app.models.prediction import Prediction
 from app.models.prediction_item import PredictionItem
 from app.models.user import User
 from app.schemas.prediction import (
+    AdminEpisodeResultsSubmit,
+    AdminSeasonCouplesSubmit,
+    AdminSeasonFinalSubmit,
     EpisodePredictionsSubmit,
     PredictionAnswer,
     PredictionsOverview,
@@ -52,6 +55,29 @@ def _season_episode_id(db: Session, fallback_id: int | None) -> int:
     if fallback_id:
         return fallback_id
     return 1
+
+
+def _ensure_admin(current_user: User) -> None:
+    if current_user.id != 1:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+
+def _apply_prediction_result(
+    db: Session,
+    prediction: Prediction,
+    is_correct: bool,
+    points: int,
+) -> None:
+    earned = points if is_correct else 0
+    delta = earned - int(prediction.earned_points or 0)
+    prediction.is_correct = is_correct
+    prediction.earned_points = earned
+    if delta:
+        user = db.query(User).filter(User.id == prediction.user_id).first()
+        if user:
+            user.points = int(user.points or 0) + delta
+            db.add(user)
+    db.add(prediction)
 
 
 def _season_final_vote_open(db: Session) -> bool:
@@ -177,6 +203,7 @@ def get_predictions_overview(
 
     return PredictionsOverview(
         next_episode=next_episode,
+        is_admin=current_user.id == 1,
         season_start_open=season_start_open,
         season_final_vote_open=season_final_vote_open,
         season_couples_locked=season_couples_locked,
@@ -358,5 +385,230 @@ def submit_episode_predictions(
                 selected_value=answer.selected_value,
             )
         )
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.post("/predictions/admin/season-couples", status_code=status.HTTP_201_CREATED)
+def submit_admin_season_couples(
+    payload: AdminSeasonCouplesSubmit,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    _ensure_admin(current_user)
+    season_episode_id = _season_episode_id(db, None)
+    correct_pairs = {f"{pair.female_id}:{pair.male_id}" for pair in payload.pairs}
+    episode = db.query(Episode).filter(Episode.id == season_episode_id).first()
+    if not episode:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    data = dict(episode.result_data or {})
+    data["season_final_couple"] = list(correct_pairs)
+    episode.result_data = data
+    db.add(episode)
+
+    predictions = (
+        db.query(Prediction)
+        .filter(
+            Prediction.prediction_type == "season_final_couple",
+            Prediction.episode_id == season_episode_id,
+        )
+        .all()
+    )
+    for prediction in predictions:
+        _apply_prediction_result(
+            db,
+            prediction,
+            prediction.selected_value in correct_pairs,
+            100,
+        )
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.post("/predictions/admin/season-final", status_code=status.HTTP_201_CREATED)
+def submit_admin_season_final(
+    payload: AdminSeasonFinalSubmit,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    _ensure_admin(current_user)
+    season_episode_id = _season_episode_id(db, None)
+    episode = db.query(Episode).filter(Episode.id == season_episode_id).first()
+    if not episode:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    data = dict(episode.result_data or {})
+    if payload.final_zero_vote_participant_id is not None:
+        data["season_final_zero"] = str(payload.final_zero_vote_participant_id)
+    if payload.season_popular_participant_id is not None:
+        data["season_popular_one"] = str(payload.season_popular_participant_id)
+    episode.result_data = data
+    db.add(episode)
+
+    if payload.final_zero_vote_participant_id is not None:
+        predictions = (
+            db.query(Prediction)
+            .filter(Prediction.prediction_type == "season_final_zero")
+            .all()
+        )
+        for prediction in predictions:
+            _apply_prediction_result(
+                db,
+                prediction,
+                prediction.selected_value == str(payload.final_zero_vote_participant_id),
+                50,
+            )
+    if payload.season_popular_participant_id is not None:
+        predictions = (
+            db.query(Prediction)
+            .filter(Prediction.prediction_type == "season_popular_one")
+            .all()
+        )
+        for prediction in predictions:
+            _apply_prediction_result(
+                db,
+                prediction,
+                prediction.selected_value == str(payload.season_popular_participant_id),
+                50,
+            )
+
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.post("/predictions/admin/episode", status_code=status.HTTP_201_CREATED)
+def submit_admin_episode_results(
+    payload: AdminEpisodeResultsSubmit,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    _ensure_admin(current_user)
+    items = (
+        db.query(PredictionItem)
+        .filter(
+            PredictionItem.id.in_([answer.prediction_item_id for answer in payload.answers]),
+            PredictionItem.scope == "episode",
+            PredictionItem.episode_id == payload.episode_id,
+        )
+        .all()
+    )
+    item_by_id = {item.id: item for item in items}
+    if len(item_by_id) != len({answer.prediction_item_id for answer in payload.answers}):
+        raise HTTPException(status_code=400, detail="Invalid prediction items")
+
+    episode = db.query(Episode).filter(Episode.id == payload.episode_id).first()
+    if not episode:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    data = dict(episode.result_data or {})
+
+    message_pairs: List[str] = []
+    like_up_value: Optional[str] = None
+    like_down_value: Optional[str] = None
+    special_values: Dict[str, str] = {}
+
+    for answer in payload.answers:
+        item = item_by_id.get(answer.prediction_item_id)
+        if not item:
+            continue
+        if item.category == "message_target":
+            message_pairs.append(answer.selected_value)
+        elif item.category == "like_up":
+            like_up_value = answer.selected_value
+        elif item.category == "like_down":
+            like_down_value = answer.selected_value
+        elif item.is_special:
+            special_values[str(answer.prediction_item_id)] = answer.selected_value
+
+    if message_pairs:
+        data["message_target"] = message_pairs
+    if like_up_value is not None:
+        data["like_up"] = like_up_value
+    if like_down_value is not None:
+        data["like_down"] = like_down_value
+    if special_values:
+        data["special"] = special_values
+
+    episode.result_data = data
+    db.add(episode)
+
+    if message_pairs:
+        message_item_ids = [
+            item.id for item in item_by_id.values() if item.category == "message_target"
+        ]
+        predictions = (
+            db.query(Prediction)
+            .filter(
+                Prediction.prediction_item_id.in_(message_item_ids),
+                Prediction.episode_id == payload.episode_id,
+            )
+            .all()
+        )
+        correct_pairs = set(message_pairs)
+        for prediction in predictions:
+            _apply_prediction_result(
+                db,
+                prediction,
+                prediction.selected_value in correct_pairs,
+                10,
+            )
+
+    if like_up_value is not None:
+        like_up_items = [item.id for item in item_by_id.values() if item.category == "like_up"]
+        predictions = (
+            db.query(Prediction)
+            .filter(
+                Prediction.prediction_item_id.in_(like_up_items),
+                Prediction.episode_id == payload.episode_id,
+            )
+            .all()
+        )
+        for prediction in predictions:
+            _apply_prediction_result(
+                db,
+                prediction,
+                prediction.selected_value == like_up_value,
+                20,
+            )
+
+    if like_down_value is not None:
+        like_down_items = [
+            item.id for item in item_by_id.values() if item.category == "like_down"
+        ]
+        predictions = (
+            db.query(Prediction)
+            .filter(
+                Prediction.prediction_item_id.in_(like_down_items),
+                Prediction.episode_id == payload.episode_id,
+            )
+            .all()
+        )
+        for prediction in predictions:
+            _apply_prediction_result(
+                db,
+                prediction,
+                prediction.selected_value == like_down_value,
+                20,
+            )
+
+    if special_values:
+        special_item_ids = [
+            item.id for item in item_by_id.values() if item.is_special
+        ]
+        predictions = (
+            db.query(Prediction)
+            .filter(
+                Prediction.prediction_item_id.in_(special_item_ids),
+                Prediction.episode_id == payload.episode_id,
+            )
+            .all()
+        )
+        for prediction in predictions:
+            correct = special_values.get(str(prediction.prediction_item_id))
+            _apply_prediction_result(
+                db,
+                prediction,
+                prediction.selected_value == correct,
+                int(prediction.betting_points or 0),
+            )
+
     db.commit()
     return {"status": "ok"}

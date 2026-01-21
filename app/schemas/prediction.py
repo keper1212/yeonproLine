@@ -48,6 +48,7 @@ class PredictionItemSummary(BaseModel):
 
 class PredictionsOverview(BaseModel):
     next_episode: Optional[EpisodeSummary] = None
+    is_admin: bool = False
     season_start_open: bool
     season_final_vote_open: bool
     season_couples_locked: bool
@@ -72,3 +73,17 @@ class EpisodePredictionsSubmit(BaseModel):
 class SeasonFinalVoteSubmit(BaseModel):
     final_zero_vote_participant_id: Optional[int] = None
     season_popular_participant_id: Optional[int] = None
+
+
+class AdminSeasonCouplesSubmit(BaseModel):
+    pairs: List[SeasonCouplePair]
+
+
+class AdminSeasonFinalSubmit(BaseModel):
+    final_zero_vote_participant_id: Optional[int] = None
+    season_popular_participant_id: Optional[int] = None
+
+
+class AdminEpisodeResultsSubmit(BaseModel):
+    episode_id: int
+    answers: List[PredictionAnswer]

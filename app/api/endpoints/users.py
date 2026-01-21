@@ -18,6 +18,7 @@ from app.schemas.user import (
     BadgeCollection,
     BadgeItem,
     EpisodePredictions,
+    NicknameUpdate,
     PredictionHistory,
     PredictionItem,
     UserSummary,
@@ -54,6 +55,64 @@ def read_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> UserSummary:
+    scored_counts = (
+        db.query(
+            func.coalesce(
+                func.sum(
+                    case((Prediction.is_correct.is_(True), 1), else_=0)
+                ),
+                0,
+            ).label("correct"),
+            func.coalesce(
+                func.sum(
+                    case((Prediction.is_correct.isnot(None), 1), else_=0)
+                ),
+                0,
+            ).label("total"),
+        )
+        .filter(Prediction.user_id == current_user.id)
+        .one()
+    )
+    participated_episodes = (
+        db.query(func.count(func.distinct(Prediction.episode_id)))
+        .filter(Prediction.user_id == current_user.id)
+        .scalar()
+    )
+
+    total = int(scored_counts.total or 0)
+    correct = int(scored_counts.correct or 0)
+    accuracy = round((correct / total) * 100, 2) if total else 0.0
+
+    primary_badge = None
+    if current_user.primary_badge_id:
+        primary_badge = (
+            db.query(BadgeMaster)
+            .filter(BadgeMaster.id == current_user.primary_badge_id)
+            .first()
+        )
+
+    return UserSummary(
+        nickname=current_user.nickname,
+        points=current_user.points,
+        accuracy_rate=accuracy,
+        participated_episodes=int(participated_episodes or 0),
+        primary_badge_id=current_user.primary_badge_id,
+        primary_badge_name=primary_badge.name if primary_badge else None,
+        primary_badge_icon_url=primary_badge.icon_url if primary_badge else None,
+    )
+
+
+@router.put("/users/me/nickname", response_model=UserSummary)
+def update_nickname(
+    payload: NicknameUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> UserSummary:
+    current_user.nickname = payload.nickname
+    db.add(current_user)
+    db.commit()
+    db.refresh(current_user)
+
     scored_counts = (
         db.query(
             func.coalesce(
