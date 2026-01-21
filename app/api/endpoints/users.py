@@ -13,15 +13,21 @@ from app.models.episode import Episode
 from app.models.prediction import Prediction
 from app.models.prediction_item import PredictionItem as PredictionItemModel
 from app.models.user import User
+from app.models.frame_master import FrameMaster
 from app.models.user_badge import UserBadge
+from app.models.user_frame import UserFrame
 from app.schemas.user import (
     AccuracyPoint,
     AccuracyTrend,
     BadgeCollection,
     BadgeItem,
+    FrameCollection,
+    FrameItem,
     EpisodePredictions,
     NicknameUpdate,
     PrimaryBadgeUpdate,
+    PrimaryFrameUpdate,
+    ShopPurchaseRequest,
     PredictionHistory,
     PredictionItem,
     UserSummary,
@@ -29,6 +35,20 @@ from app.schemas.user import (
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/google")
+
+SHOP_FRAMES = {
+    "frame-gold": {"name": "엔티크 골든 로즈", "price": 800},
+    "frame-heart": {"name": "핑크 하트 시그널", "price": 800},
+    "frame-water": {"name": "흩날리는 물보라", "price": 800},
+    "frame-tree": {"name": "숲속의 작은 초대", "price": 800},
+    "frame-flower": {"name": "벚꽃 아래, 우리", "price": 800},
+    "frame-black": {"name": "금지된 다크 글리치", "price": 800},
+}
+
+SHOP_BADGES = {
+    "badge-ring": {"name": "약속의 다이아몬드", "price": 1000},
+    "badge-heart-bit": {"name": "네온 하트", "price": 1000},
+}
 
 
 def get_current_user(
@@ -93,6 +113,13 @@ def read_summary(
             .filter(BadgeMaster.id == current_user.primary_badge_id)
             .first()
         )
+    primary_frame = None
+    if current_user.primary_frame_id:
+        primary_frame = (
+            db.query(FrameMaster)
+            .filter(FrameMaster.id == current_user.primary_frame_id)
+            .first()
+        )
 
     return UserSummary(
         nickname=current_user.nickname,
@@ -102,6 +129,60 @@ def read_summary(
         primary_badge_id=current_user.primary_badge_id,
         primary_badge_name=primary_badge.name if primary_badge else None,
         primary_badge_icon_url=primary_badge.icon_url if primary_badge else None,
+        primary_frame_id=current_user.primary_frame_id,
+        primary_frame_name=primary_frame.name if primary_frame else None,
+        primary_frame_icon_url=primary_frame.icon_url if primary_frame else None,
+    )
+
+
+def _build_summary(db: Session, user: User) -> UserSummary:
+    scored_counts = (
+        db.query(
+            func.coalesce(
+                func.sum(case((Prediction.is_correct.is_(True), 1), else_=0)),
+                0,
+            ).label("correct"),
+            func.coalesce(
+                func.sum(case((Prediction.is_correct.isnot(None), 1), else_=0)),
+                0,
+            ).label("total"),
+        )
+        .filter(Prediction.user_id == user.id)
+        .one()
+    )
+    participated_episodes = (
+        db.query(func.count(func.distinct(Prediction.episode_id)))
+        .filter(Prediction.user_id == user.id)
+        .scalar()
+    )
+    total = int(scored_counts.total or 0)
+    correct = int(scored_counts.correct or 0)
+    accuracy = round((correct / total) * 100, 2) if total else 0.0
+    primary_badge = None
+    if user.primary_badge_id:
+        primary_badge = (
+            db.query(BadgeMaster)
+            .filter(BadgeMaster.id == user.primary_badge_id)
+            .first()
+        )
+    primary_frame = None
+    if user.primary_frame_id:
+        primary_frame = (
+            db.query(FrameMaster)
+            .filter(FrameMaster.id == user.primary_frame_id)
+            .first()
+        )
+    return UserSummary(
+        nickname=user.nickname,
+        points=user.points,
+        accuracy_rate=accuracy,
+        participated_episodes=int(participated_episodes or 0),
+        primary_badge_id=user.primary_badge_id,
+        primary_badge_name=primary_badge.name if primary_badge else None,
+        primary_badge_icon_url=primary_badge.icon_url if primary_badge else None,
+        primary_frame_id=user.primary_frame_id,
+        primary_frame_name=primary_frame.name if primary_frame else None,
+        primary_frame_icon_url=primary_frame.icon_url if primary_frame else None,
     )
 
 
@@ -305,52 +386,7 @@ def update_nickname(
     db.add(current_user)
     db.commit()
     db.refresh(current_user)
-
-    scored_counts = (
-        db.query(
-            func.coalesce(
-                func.sum(
-                    case((Prediction.is_correct.is_(True), 1), else_=0)
-                ),
-                0,
-            ).label("correct"),
-            func.coalesce(
-                func.sum(
-                    case((Prediction.is_correct.isnot(None), 1), else_=0)
-                ),
-                0,
-            ).label("total"),
-        )
-        .filter(Prediction.user_id == current_user.id)
-        .one()
-    )
-    participated_episodes = (
-        db.query(func.count(func.distinct(Prediction.episode_id)))
-        .filter(Prediction.user_id == current_user.id)
-        .scalar()
-    )
-
-    total = int(scored_counts.total or 0)
-    correct = int(scored_counts.correct or 0)
-    accuracy = round((correct / total) * 100, 2) if total else 0.0
-
-    primary_badge = None
-    if current_user.primary_badge_id:
-        primary_badge = (
-            db.query(BadgeMaster)
-            .filter(BadgeMaster.id == current_user.primary_badge_id)
-            .first()
-        )
-
-    return UserSummary(
-        nickname=current_user.nickname,
-        points=current_user.points,
-        accuracy_rate=accuracy,
-        participated_episodes=int(participated_episodes or 0),
-        primary_badge_id=current_user.primary_badge_id,
-        primary_badge_name=primary_badge.name if primary_badge else None,
-        primary_badge_icon_url=primary_badge.icon_url if primary_badge else None,
-    )
+    return _build_summary(db, current_user)
 
 
 @router.put("/users/me/primary-badge", response_model=UserSummary)
@@ -374,50 +410,94 @@ def update_primary_badge(
     db.add(current_user)
     db.commit()
     db.refresh(current_user)
+    return _build_summary(db, current_user)
 
-    scored_counts = (
-        db.query(
-            func.coalesce(
-                func.sum(
-                    case((Prediction.is_correct.is_(True), 1), else_=0)
-                ),
-                0,
-            ).label("correct"),
-            func.coalesce(
-                func.sum(
-                    case((Prediction.is_correct.isnot(None), 1), else_=0)
-                ),
-                0,
-            ).label("total"),
+
+@router.put("/users/me/primary-frame", response_model=UserSummary)
+def update_primary_frame(
+    payload: PrimaryFrameUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> UserSummary:
+    owned = (
+        db.query(UserFrame)
+        .filter(
+            UserFrame.user_id == current_user.id,
+            UserFrame.frame_id == payload.frame_id,
         )
-        .filter(Prediction.user_id == current_user.id)
-        .one()
-    )
-    participated_episodes = (
-        db.query(func.count(func.distinct(Prediction.episode_id)))
-        .filter(Prediction.user_id == current_user.id)
-        .scalar()
-    )
-
-    total = int(scored_counts.total or 0)
-    correct = int(scored_counts.correct or 0)
-    accuracy = round((correct / total) * 100, 2) if total else 0.0
-
-    primary_badge = (
-        db.query(BadgeMaster)
-        .filter(BadgeMaster.id == current_user.primary_badge_id)
         .first()
     )
+    if not owned:
+        raise HTTPException(status_code=400, detail="Frame not owned")
+    current_user.primary_frame_id = payload.frame_id
+    db.add(current_user)
+    db.commit()
+    return _build_summary(db, current_user)
 
-    return UserSummary(
-        nickname=current_user.nickname,
-        points=current_user.points,
-        accuracy_rate=accuracy,
-        participated_episodes=int(participated_episodes or 0),
-        primary_badge_id=current_user.primary_badge_id,
-        primary_badge_name=primary_badge.name if primary_badge else None,
-        primary_badge_icon_url=primary_badge.icon_url if primary_badge else None,
-    )
+
+@router.post("/users/me/shop/purchase", response_model=UserSummary)
+def purchase_shop_item(
+    payload: ShopPurchaseRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> UserSummary:
+    if payload.item_type == "badge":
+        config = SHOP_BADGES.get(payload.item_id)
+        if not config:
+            raise HTTPException(status_code=400, detail="Invalid badge item")
+        price = int(config["price"])
+        badge = (
+            db.query(BadgeMaster)
+            .filter(BadgeMaster.name == config["name"])
+            .first()
+        )
+        if not badge:
+            raise HTTPException(status_code=404, detail="Badge not found")
+        already = (
+            db.query(UserBadge)
+            .filter(UserBadge.user_id == current_user.id, UserBadge.badge_id == badge.id)
+            .first()
+        )
+        if already:
+            raise HTTPException(status_code=409, detail="Badge already owned")
+        if current_user.points < price:
+            raise HTTPException(status_code=400, detail="Not enough points")
+        current_user.points = int(current_user.points or 0) - price
+        db.add(UserBadge(user_id=current_user.id, badge_id=badge.id, earned_at=datetime.utcnow()))
+        db.add(current_user)
+        db.commit()
+        return _build_summary(db, current_user)
+
+    if payload.item_type == "frame":
+        config = SHOP_FRAMES.get(payload.item_id)
+        if not config:
+            raise HTTPException(status_code=400, detail="Invalid frame item")
+        price = int(config["price"])
+        frame = (
+            db.query(FrameMaster)
+            .filter(FrameMaster.name == config["name"])
+            .first()
+        )
+        if not frame:
+            raise HTTPException(status_code=404, detail="Frame not found")
+        already = (
+            db.query(UserFrame)
+            .filter(UserFrame.user_id == current_user.id, UserFrame.frame_id == frame.id)
+            .first()
+        )
+        if already:
+            raise HTTPException(status_code=409, detail="Frame already owned")
+        if current_user.points < price:
+            raise HTTPException(status_code=400, detail="Not enough points")
+        current_user.points = int(current_user.points or 0) - price
+        db.add(UserFrame(user_id=current_user.id, frame_id=frame.id, earned_at=datetime.utcnow()))
+        if not current_user.primary_frame_id:
+            current_user.primary_frame_id = frame.id
+        db.add(current_user)
+        db.commit()
+        return _build_summary(db, current_user)
+
+    raise HTTPException(status_code=400, detail="Invalid purchase type")
 
 
 @router.get("/users/me/badges", response_model=BadgeCollection)
@@ -448,6 +528,37 @@ def read_badges(
                 earned_at=earned_at,
             )
             for badge, earned_at in rows
+        ]
+    )
+
+
+@router.get("/users/me/frames", response_model=FrameCollection)
+def read_frames(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> FrameCollection:
+    rows = (
+        db.query(FrameMaster, UserFrame.earned_at)
+        .outerjoin(
+            UserFrame,
+            (UserFrame.frame_id == FrameMaster.id)
+            & (UserFrame.user_id == current_user.id),
+        )
+        .order_by(FrameMaster.id.asc())
+        .all()
+    )
+    return FrameCollection(
+        frames=[
+            FrameItem(
+                id=frame.id,
+                name=frame.name,
+                description=frame.description,
+                icon_url=frame.icon_url,
+                price=frame.price or 0,
+                is_owned=earned_at is not None,
+                earned_at=earned_at,
+            )
+            for frame, earned_at in rows
         ]
     )
 

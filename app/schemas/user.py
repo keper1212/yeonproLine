@@ -1,6 +1,8 @@
 from datetime import datetime
 from typing import List, Optional
 
+from typing import Literal
+
 from pydantic import BaseModel, constr
 
 
@@ -27,6 +29,15 @@ class PrimaryBadgeUpdate(BaseModel):
     badge_id: int
 
 
+class ShopPurchaseRequest(BaseModel):
+    item_type: Literal["badge", "frame"]
+    item_id: str
+
+
+class PrimaryFrameUpdate(BaseModel):
+    frame_id: int
+
+
 class UserAnalysis(BaseModel):
     label: str
     description: str
@@ -41,6 +52,9 @@ class UserSummary(BaseModel):
     primary_badge_id: Optional[int] = None
     primary_badge_name: Optional[str] = None
     primary_badge_icon_url: Optional[str] = None
+    primary_frame_id: Optional[int] = None
+    primary_frame_name: Optional[str] = None
+    primary_frame_icon_url: Optional[str] = None
 
 
 class BadgeItem(BaseModel):
@@ -54,6 +68,20 @@ class BadgeItem(BaseModel):
 
 class BadgeCollection(BaseModel):
     badges: List[BadgeItem]
+
+
+class FrameItem(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    icon_url: Optional[str] = None
+    price: int
+    is_owned: bool
+    earned_at: Optional[datetime] = None
+
+
+class FrameCollection(BaseModel):
+    frames: List[FrameItem]
 
 
 class AccuracyPoint(BaseModel):
