@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError
@@ -102,6 +104,192 @@ def read_summary(
     )
 
 
+def _award_badges(db: Session, user: User) -> None:
+    badge_names = [
+        "연프 촉",
+        "편집 읽는 사람",
+        "역배 전문가",
+        "분석왕",
+        "초심자",
+        "열정팬",
+    ]
+    badge_rows = (
+        db.query(BadgeMaster)
+        .filter(BadgeMaster.name.in_(badge_names))
+        .all()
+    )
+    badge_by_name = {badge.name: badge for badge in badge_rows}
+    if not badge_by_name:
+        return
+
+    existing_badges = {
+        row.badge_id
+        for row in db.query(UserBadge.badge_id)
+        .filter(UserBadge.user_id == user.id)
+        .all()
+    }
+
+    def add_badge(name: str) -> None:
+        badge = badge_by_name.get(name)
+        if not badge or badge.id in existing_badges:
+            return
+        db.add(UserBadge(user_id=user.id, badge_id=badge.id, earned_at=datetime.utcnow()))
+        existing_badges.add(badge.id)
+
+    has_prediction = (
+        db.query(Prediction.id)
+        .filter(Prediction.user_id == user.id)
+        .first()
+        is not None
+    )
+    if has_prediction:
+        add_badge("초심자")
+
+    season_couple_correct = (
+        db.query(func.count(Prediction.id))
+        .filter(
+            Prediction.user_id == user.id,
+            Prediction.prediction_type == "season_final_couple",
+            Prediction.is_correct.is_(True),
+        )
+        .scalar()
+    )
+    if int(season_couple_correct or 0) >= 3:
+        add_badge("연프 촉")
+
+    special_items = (
+        db.query(PredictionItemModel.id, PredictionItemModel.episode_id)
+        .filter(
+            PredictionItemModel.scope == "episode",
+            PredictionItemModel.is_special.is_(True),
+        )
+        .all()
+    )
+    if special_items:
+        special_by_episode: dict[int, list[int]] = {}
+        for item_id, episode_id in special_items:
+            if episode_id is None:
+                continue
+            special_by_episode.setdefault(int(episode_id), []).append(int(item_id))
+        episode_ids = sorted(special_by_episode.keys())
+        if episode_ids:
+            episode_numbers = {
+                row.id: row.episode_number
+                for row in db.query(Episode.id, Episode.episode_number)
+                .filter(Episode.id.in_(episode_ids))
+                .all()
+            }
+            episode_ok: dict[int, bool] = {}
+            for ep_id, item_ids in special_by_episode.items():
+                rows = (
+                    db.query(Prediction)
+                    .filter(
+                        Prediction.user_id == user.id,
+                        Prediction.prediction_item_id.in_(item_ids),
+                    )
+                    .all()
+                )
+                if len(rows) != len(item_ids):
+                    episode_ok[ep_id] = False
+                    continue
+                episode_ok[ep_id] = all(row.is_correct is True for row in rows)
+
+            streak = 0
+            last_ep_num = None
+            for ep_id in episode_ids:
+                ep_num = episode_numbers.get(ep_id)
+                if ep_num is None:
+                    continue
+                if episode_ok.get(ep_id) is True:
+                    if last_ep_num is None or ep_num == last_ep_num + 1:
+                        streak += 1
+                    else:
+                        streak = 1
+                    last_ep_num = ep_num
+                else:
+                    streak = 0
+                    last_ep_num = ep_num
+                if streak >= 5:
+                    add_badge("편집 읽는 사람")
+                    break
+
+    total_counts = dict(
+        db.query(Prediction.prediction_item_id, func.count(Prediction.id))
+        .group_by(Prediction.prediction_item_id)
+        .all()
+    )
+    value_counts = (
+        db.query(
+            Prediction.prediction_item_id,
+            Prediction.selected_value,
+            func.count(Prediction.id),
+        )
+        .group_by(Prediction.prediction_item_id, Prediction.selected_value)
+        .all()
+    )
+    ratio_map: dict[tuple[int, str], float] = {}
+    for item_id, selected_value, count in value_counts:
+        total = total_counts.get(item_id, 0)
+        if total:
+            ratio_map[(int(item_id), str(selected_value))] = count / total
+
+    rare_correct = 0
+    user_correct = (
+        db.query(Prediction.prediction_item_id, Prediction.selected_value)
+        .filter(Prediction.user_id == user.id, Prediction.is_correct.is_(True))
+        .all()
+    )
+    for item_id, selected_value in user_correct:
+        ratio = ratio_map.get((int(item_id), str(selected_value)))
+        if ratio is not None and ratio < 0.2:
+            rare_correct += 1
+    if rare_correct >= 3:
+        add_badge("역배 전문가")
+
+    analysis_items = (
+        db.query(PredictionItemModel.id)
+        .filter(PredictionItemModel.category.in_(["job_guess", "age_guess"]))
+        .all()
+    )
+    analysis_item_ids = [int(row.id) for row in analysis_items]
+    if analysis_item_ids:
+        analysis_rows = (
+            db.query(Prediction)
+            .filter(
+                Prediction.user_id == user.id,
+                Prediction.prediction_item_id.in_(analysis_item_ids),
+            )
+            .all()
+        )
+        if len(analysis_rows) == len(analysis_item_ids) and all(
+            row.is_correct is True for row in analysis_rows
+        ):
+            add_badge("분석왕")
+
+    episode_item_ids = (
+        db.query(PredictionItemModel.episode_id)
+        .filter(PredictionItemModel.scope == "episode")
+        .distinct()
+        .all()
+    )
+    episode_ids = [int(row.episode_id) for row in episode_item_ids if row.episode_id]
+    if episode_ids:
+        user_episode_ids = (
+            db.query(Prediction.episode_id)
+            .filter(
+                Prediction.user_id == user.id,
+                Prediction.episode_id.in_(episode_ids),
+            )
+            .distinct()
+            .all()
+        )
+        user_episode_set = {int(row.episode_id) for row in user_episode_ids if row.episode_id}
+        if len(user_episode_set) == len(set(episode_ids)):
+            add_badge("열정팬")
+
+    db.commit()
+
+
 @router.put("/users/me/nickname", response_model=UserSummary)
 def update_nickname(
     payload: NicknameUpdate,
@@ -165,6 +353,7 @@ def read_badges(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> BadgeCollection:
+    _award_badges(db, current_user)
     rows = (
         db.query(BadgeMaster, UserBadge.earned_at)
         .outerjoin(
