@@ -21,6 +21,7 @@ def read_rankings(
             User.id.label("user_id"),
             func.rank().over(order_by=User.points.desc()).label("rank"),
         )
+        .filter(User.id != 1)
         .subquery()
     )
 
