@@ -12,6 +12,7 @@ from app.models.prediction_item import PredictionItem
 from app.models.user import User
 from app.schemas.prediction import (
     EpisodePredictionsSubmit,
+    PredictionAnswer,
     PredictionsOverview,
     SeasonCouplePair,
     SeasonCouplesSubmit,
@@ -130,6 +131,21 @@ def get_predictions_overview(
             .order_by(PredictionItem.id.asc())
             .all()
         )
+    episode_answers = []
+    if next_episode:
+        episode_answers = [
+            PredictionAnswer(
+                prediction_item_id=row.prediction_item_id,
+                selected_value=row.selected_value,
+                target_participant_id=row.target_participant_id,
+            )
+            for row in db.query(Prediction)
+            .filter(
+                Prediction.user_id == current_user.id,
+                Prediction.episode_id == next_episode.id,
+            )
+            .all()
+        ]
     episode_predictions_locked = False
     if next_episode:
         episode_predictions_locked = (
@@ -168,6 +184,7 @@ def get_predictions_overview(
         episode_predictions_locked=episode_predictions_locked,
         participants=participants,
         episode_items=episode_items,
+        episode_answers=episode_answers,
         season_final_zero_vote=int(final_zero_vote.selected_value)
         if final_zero_vote
         else None,

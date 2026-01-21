@@ -27,6 +27,12 @@ class SeasonCouplePair(BaseModel):
     male_id: int
 
 
+class PredictionAnswer(BaseModel):
+    prediction_item_id: int
+    selected_value: str
+    target_participant_id: Optional[int] = None
+
+
 class PredictionItemSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -49,18 +55,13 @@ class PredictionsOverview(BaseModel):
     episode_predictions_locked: bool = False
     participants: List[ParticipantSummary] = Field(default_factory=list)
     episode_items: List[PredictionItemSummary] = Field(default_factory=list)
+    episode_answers: List[PredictionAnswer] = Field(default_factory=list)
     season_final_zero_vote: Optional[int] = None
     season_popular_one: Optional[int] = None
 
 
 class SeasonCouplesSubmit(BaseModel):
     pairs: List[SeasonCouplePair]
-
-
-class PredictionAnswer(BaseModel):
-    prediction_item_id: int
-    selected_value: str
-    target_participant_id: Optional[int] = None
 
 
 class EpisodePredictionsSubmit(BaseModel):
