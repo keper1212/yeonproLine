@@ -23,6 +23,10 @@ class NicknameUpdate(BaseModel):
     nickname: constr(min_length=2, max_length=50)
 
 
+class PrimaryBadgeUpdate(BaseModel):
+    badge_id: int
+
+
 class UserAnalysis(BaseModel):
     label: str
     description: str
